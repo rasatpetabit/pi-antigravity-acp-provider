@@ -40,13 +40,10 @@ describe("resolveNodeBinary", () => {
 		expect(resolveNodeBinary("C:\\Program Files\\nodejs\\node.exe")).toBe("C:\\Program Files\\nodejs\\node.exe");
 	});
 
-	it("falls back to ambient node when process.execPath is a standalone binary like pi", () => {
-		// resolveNodeBinary() with no explicit override evaluates
-		// process.execPath; stub it to simulate running inside a standalone
-		// Pi binary with no NODE env override.
+	it("finds a Node executable on the child PATH when Pi is standalone", () => {
 		const original = process.execPath;
-		const originalNode = process.env.NODE;
-		delete process.env.NODE;
+		const binDir = path.resolve("fake-node-bin");
+		const node = path.join(binDir, process.platform === "win32" ? "node.exe" : "node");
 		try {
 			for (const piExecPath of [
 				"/nix/store/ai9szyf9fivph9rdk65gzjiy30sll754-pi-0.87.1/libexec/pi/pi",
@@ -54,12 +51,53 @@ describe("resolveNodeBinary", () => {
 				"C:\\bin\\pi.exe",
 			]) {
 				Object.defineProperty(process, "execPath", { value: piExecPath, configurable: true });
-				expect(resolveNodeBinary()).toBe("node");
+				expect(resolveNodeBinary(undefined, { PATH: binDir }, (file) => file === node)).toBe(node);
 			}
 		} finally {
 			Object.defineProperty(process, "execPath", { value: original, configurable: true });
-			if (originalNode === undefined) delete process.env.NODE;
-			else process.env.NODE = originalNode;
+		}
+	});
+
+	it("keeps process.execPath when Node is named nodejs even without node on PATH", () => {
+		const original = process.execPath;
+		const nodejs = "/nix/store/example-nodejs/bin/nodejs";
+		try {
+			Object.defineProperty(process, "execPath", { value: nodejs, configurable: true });
+			expect(resolveNodeBinary(undefined, { PATH: "" })).toBe(nodejs);
+		} finally {
+			Object.defineProperty(process, "execPath", { value: original, configurable: true });
+		}
+	});
+
+	it("finds nodejs on PATH when standalone Pi has no node executable", () => {
+		const original = process.execPath;
+		const binDir = path.resolve("fake-nodejs-bin");
+		const nodejs = path.join(binDir, process.platform === "win32" ? "nodejs.exe" : "nodejs");
+		try {
+			Object.defineProperty(process, "execPath", { value: "/usr/local/bin/pi", configurable: true });
+			expect(resolveNodeBinary(undefined, { PATH: binDir }, (file) => file === nodejs)).toBe(nodejs);
+		} finally {
+			Object.defineProperty(process, "execPath", { value: original, configurable: true });
+		}
+	});
+
+	it("ignores relative PATH entries, which may resolve under a different cwd", () => {
+		const original = process.execPath;
+		try {
+			Object.defineProperty(process, "execPath", { value: "/usr/local/bin/pi", configurable: true });
+			expect(() => resolveNodeBinary(undefined, { PATH: "bin" }, () => true)).toThrow(/set NODE/);
+		} finally {
+			Object.defineProperty(process, "execPath", { value: original, configurable: true });
+		}
+	});
+
+	it("reports how to configure Node when standalone Pi cannot find it", () => {
+		const original = process.execPath;
+		try {
+			Object.defineProperty(process, "execPath", { value: "/usr/local/bin/pi", configurable: true });
+			expect(() => resolveNodeBinary(undefined, { PATH: "" })).toThrow(/set NODE/);
+		} finally {
+			Object.defineProperty(process, "execPath", { value: original, configurable: true });
 		}
 	});
 
@@ -91,6 +129,8 @@ describe("resolveNodeBinary", () => {
 		try {
 			process.env.NODE = "/opt/custom/bin/node";
 			expect(resolveNodeBinary()).toBe("/opt/custom/bin/node");
+			// An explicit child environment must not inherit a different NODE from Pi.
+			expect(resolveNodeBinary(undefined, { NODE: "/child/nodejs" })).toBe("/child/nodejs");
 		} finally {
 			if (original === undefined) delete process.env.NODE;
 			else process.env.NODE = original;
@@ -122,6 +162,16 @@ describe("resolveDefaultSslCertFile", () => {
 	it("returns undefined when no candidates exist", () => {
 		const exists = () => false;
 		expect(resolveDefaultSslCertFile({}, exists)).toBeUndefined();
+	});
+
+	it("does not select a directory as a CA bundle", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "antigravity-ca-directory-"));
+		try {
+			expect(resolveDefaultSslCertFile({ NIX_SSL_CERT_FILE: directory })).not.toBe(directory);
+			expect(applyDefaultTlsEnvironment({ NIX_SSL_CERT_FILE: directory }).SSL_CERT_FILE).not.toBe(directory);
+		} finally {
+			await fs.rm(directory, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -195,10 +245,79 @@ describe("applyDefaultTlsEnvironment", () => {
 		expect(reported.sslCertFile).toBe(detected);
 	});
 
+	it.skipIf(process.platform === "win32")("launches the supervisor via nodejs when node is not on PATH", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "antigravity-nodejs-"));
+		const nodejs = path.join(directory, "nodejs");
+		const originalExecPath = process.execPath;
+		try {
+			await fs.symlink(originalExecPath, nodejs);
+			Object.defineProperty(process, "execPath", { value: nodejs, configurable: true });
+			const child = new AntigravityProcess({
+				cwd: process.cwd(),
+				entryPath: exitAgentFixture,
+				env: { ...process.env, PATH: "", NODE: "" },
+			});
+			try {
+				const exit = await Promise.race([
+					child.exited,
+					delay(2_000).then(() => {
+						throw new Error("nodejs supervisor did not exit");
+					}),
+				]);
+				expect(exit.code).toBe(3);
+			} finally {
+				await child.close();
+			}
+		} finally {
+			Object.defineProperty(process, "execPath", { value: originalExecPath, configurable: true });
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"launches standalone Pi's ACP with a Nix-style Node override and CA bundle but no ambient node",
+		async () => {
+			const directory = await fs.mkdtemp(path.join(os.tmpdir(), "antigravity-nix-"));
+			const node = path.join(directory, "custom-nodejs-wrapper");
+			const certFile = path.join(directory, "ca-bundle.crt");
+			const certTarget = path.join(directory, "nix-store-ca.crt");
+			const originalExecPath = process.execPath;
+			try {
+				await fs.symlink(originalExecPath, node);
+				await fs.writeFile(certTarget, "test CA bundle\n");
+				await fs.symlink(certTarget, certFile); // NixOS /etc CA paths are symlinks into the store.
+				Object.defineProperty(process, "execPath", { value: "/nix/store/example-pi/libexec/pi/pi", configurable: true });
+				const env: NodeJS.ProcessEnv = {
+					...process.env,
+					PATH: directory, // Neither node nor nodejs is on PATH.
+					NODE: node,
+					NIX_SSL_CERT_FILE: certFile,
+				};
+				delete env.SSL_CERT_FILE;
+				const child = new AntigravityProcess({ cwd: process.cwd(), entryPath: envDumpFixture, env });
+				try {
+					const exit = await Promise.race([
+						child.exited,
+						delay(2_000).then(() => {
+							throw new Error("Nix-style ACP supervisor did not exit");
+						}),
+					]);
+					expect(exit.code).toBe(0);
+					expect(JSON.parse(exit.stderrTail)).toEqual({ sslCertFile: certFile });
+				} finally {
+					await child.close();
+				}
+			} finally {
+				Object.defineProperty(process, "execPath", { value: originalExecPath, configurable: true });
+				await fs.rm(directory, { recursive: true, force: true });
+			}
+		},
+	);
+
 	it("propagates custom-CA environment when running as a standalone Pi binary", async () => {
 		// Simulates running inside a standalone Pi binary (process.execPath
-		// points to pi rather than node). resolveNodeBinary must fall back to
-		// ambient "node" to spawn the supervisor, and the injected CA bundle
+		// points to pi rather than node). resolveNodeBinary must find Node on
+		// PATH to spawn the supervisor, and the injected CA bundle
 		// must propagate through supervisor to the agent.
 		const originalExecPath = process.execPath;
 		const originalNode = process.env.NODE;
@@ -230,6 +349,7 @@ describe("applyDefaultTlsEnvironment", () => {
 		}
 	});
 });
+
 describe.skipIf(process.platform === "win32")("parent-death supervisor", () => {
 	it("escalates from TERM to KILL for a stuck direct child", async () => {
 		const child = new AntigravityProcess({

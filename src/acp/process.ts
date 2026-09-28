@@ -35,20 +35,50 @@ export function resolveAntigravityAcpEntry(): string {
 	return resolveAntigravityAcpLaunch().command;
 }
 
-export function resolveNodeBinary(execPath?: string): string {
-	// An explicitly provided executable (entry option or NODE env override set
-	// by the caller/package manager) is trusted as-is: NixOS names its node
-	// wrapper "nodejs", and basename matching would silently discard a valid
-	// override when no ambient node exists.
-	const explicit = execPath || process.env.NODE;
-	if (explicit) return explicit;
+export function resolveNodeBinary(
+	explicit?: string,
+	env: NodeJS.ProcessEnv = process.env,
+	isExecutable: (filePath: string) => boolean = isExecutableFile,
+): string {
+	// An override may be a wrapper with any filename; use the same environment
+	// that will be passed to the supervisor when resolving it.
+	const override = explicit || env.NODE;
+	if (override) return override;
 	const candidate = process.execPath;
 	const base = (candidate.split(/[\\/]/).pop() ?? "").toLowerCase();
-	// When Pi is distributed as a standalone executable (e.g. NixOS package,
-	// SEA, or packaged release), process.execPath points to the pi binary rather
-	// than node. Fall back to standard ambient node in that case.
-	if (/^node(?:\.exe|\.cmd|\.bat)?$/i.test(base)) return candidate;
-	return "node";
+	// A standalone Pi binary is not a Node interpreter, but Node itself can be
+	// named nodejs (not just node), particularly in Nix environments.
+	if (/^node(?:js)?(?:\.exe|\.cmd|\.bat)?$/.test(base)) return candidate;
+	for (const directory of (env.PATH ?? env.Path ?? "").split(path.delimiter)) {
+		// Only use absolute PATH entries: the supervisor may spawn with a
+		// different cwd than the caller used to resolve this executable.
+		if (!path.isAbsolute(directory)) continue;
+		for (const name of process.platform === "win32" ? ["node.exe", "nodejs.exe"] : ["node", "nodejs"]) {
+			const binary = path.join(directory, name);
+			if (isExecutable(binary)) return binary;
+		}
+	}
+	throw new Error(
+		"Node.js is required to launch the Antigravity ACP supervisor; install node or set NODE to its executable path.",
+	);
+}
+
+function isExecutableFile(filePath: string): boolean {
+	try {
+		fs.accessSync(filePath, fs.constants.X_OK);
+		return fs.statSync(filePath).isFile();
+	} catch {
+		return false;
+	}
+}
+
+function isReadableRegularFile(filePath: string): boolean {
+	try {
+		fs.accessSync(filePath, fs.constants.R_OK);
+		return fs.statSync(filePath).isFile();
+	} catch {
+		return false;
+	}
 }
 
 export const DEFAULT_CA_BUNDLE_PATHS = [
@@ -61,27 +91,28 @@ export const DEFAULT_CA_BUNDLE_PATHS = [
 
 export function resolveDefaultSslCertFile(
 	env: NodeJS.ProcessEnv = process.env,
-	exists: (filePath: string) => boolean = fs.existsSync,
+	isReadableFile: (filePath: string) => boolean = isReadableRegularFile,
 ): string | undefined {
-	if (env.SSL_CERT_FILE && exists(env.SSL_CERT_FILE)) return env.SSL_CERT_FILE;
-	if (env.NIX_SSL_CERT_FILE && exists(env.NIX_SSL_CERT_FILE)) return env.NIX_SSL_CERT_FILE;
+	if (env.SSL_CERT_FILE && isReadableFile(env.SSL_CERT_FILE)) return env.SSL_CERT_FILE;
+	if (env.NIX_SSL_CERT_FILE && isReadableFile(env.NIX_SSL_CERT_FILE)) return env.NIX_SSL_CERT_FILE;
 	for (const candidate of DEFAULT_CA_BUNDLE_PATHS) {
-		if (exists(candidate)) return candidate;
+		if (isReadableFile(candidate)) return candidate;
 	}
 	return undefined;
 }
 
 export function applyDefaultTlsEnvironment(
 	baseEnv: NodeJS.ProcessEnv = process.env,
-	exists: (filePath: string) => boolean = fs.existsSync,
+	isReadableFile: (filePath: string) => boolean = isReadableRegularFile,
 ): NodeJS.ProcessEnv {
 	const env = { ...baseEnv };
 	if (!env.SSL_CERT_FILE) {
-		const certFile = resolveDefaultSslCertFile(env, exists);
+		const certFile = resolveDefaultSslCertFile(env, isReadableFile);
 		if (certFile) env.SSL_CERT_FILE = certFile;
 	}
 	return env;
 }
+
 export class AntigravityProcess {
 	readonly generation = nextGeneration++;
 	readonly child: ChildProcessWithoutNullStreams;
@@ -100,7 +131,7 @@ export class AntigravityProcess {
 			command = options.command;
 			args = options.args ?? [];
 		} else {
-			const nodeBinary = resolveNodeBinary(options.env?.NODE);
+			const nodeBinary = resolveNodeBinary(options.env?.NODE, options.env ?? process.env);
 			const launch = options.entryPath
 				? { command: nodeBinary, args: [options.entryPath, ...(options.args ?? [])] }
 				: resolveAntigravityAcpLaunch();

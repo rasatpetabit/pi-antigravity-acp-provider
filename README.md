@@ -50,6 +50,8 @@ In Pi:
 
 The provider first looks at `AGY_ACP_BIN`, then its verified managed `~/.local/opt/agy-acp/current/` release, `~/.local/bin/agy_acp_server.par`, and `PATH`. Set `AGY_ACP_BIN` to explicitly prefer an externally managed runtime. If absent, it installs the platform build published in the ACP registry. A global `agy` or `gemini` command is not required.
 
+Standalone Pi builds also need Node.js to run the ACP supervisor. The provider looks for `node` or `nodejs` on `PATH`; set `NODE` to the executable path if neither is available. On NixOS with Home Manager, `programs.pi-coding-agent.extraPackages = [ pkgs.nodejs ];` adds Node to Pi's `PATH`. An explicit `SSL_CERT_FILE` is preserved; otherwise the provider uses `NIX_SSL_CERT_FILE` or a readable system CA bundle when available.
+
 ### SSH and headless Google login
 
 When Pi is running over SSH, or on Linux without `DISPLAY`/`WAYLAND_DISPLAY`, `/login` automatically uses a manual browser relay:
