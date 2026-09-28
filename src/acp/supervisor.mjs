@@ -2,6 +2,10 @@
 
 import { spawn } from "node:child_process";
 
+// SSL_CERT_FILE is resolved by AntigravityProcess.applyDefaultTlsEnvironment
+// before this supervisor is spawned; the supervisor passes its environment
+// through to the agent unchanged.
+
 const forwarded = process.argv.slice(2);
 const genericCommand = forwarded[0] === "--command";
 if (genericCommand) forwarded.shift();

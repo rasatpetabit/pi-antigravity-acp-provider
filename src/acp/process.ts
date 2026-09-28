@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
@@ -34,6 +35,53 @@ export function resolveAntigravityAcpEntry(): string {
 	return resolveAntigravityAcpLaunch().command;
 }
 
+export function resolveNodeBinary(execPath?: string): string {
+	// An explicitly provided executable (entry option or NODE env override set
+	// by the caller/package manager) is trusted as-is: NixOS names its node
+	// wrapper "nodejs", and basename matching would silently discard a valid
+	// override when no ambient node exists.
+	const explicit = execPath || process.env.NODE;
+	if (explicit) return explicit;
+	const candidate = process.execPath;
+	const base = (candidate.split(/[\\/]/).pop() ?? "").toLowerCase();
+	// When Pi is distributed as a standalone executable (e.g. NixOS package,
+	// SEA, or packaged release), process.execPath points to the pi binary rather
+	// than node. Fall back to standard ambient node in that case.
+	if (/^node(?:\.exe|\.cmd|\.bat)?$/i.test(base)) return candidate;
+	return "node";
+}
+
+export const DEFAULT_CA_BUNDLE_PATHS = [
+	"/etc/ssl/certs/ca-bundle.crt",
+	"/etc/ssl/certs/ca-certificates.crt",
+	"/etc/pki/tls/certs/ca-bundle.crt",
+	"/etc/ssl/ca-bundle.pem",
+	"/etc/ssl/cert.pem",
+];
+
+export function resolveDefaultSslCertFile(
+	env: NodeJS.ProcessEnv = process.env,
+	exists: (filePath: string) => boolean = fs.existsSync,
+): string | undefined {
+	if (env.SSL_CERT_FILE && exists(env.SSL_CERT_FILE)) return env.SSL_CERT_FILE;
+	if (env.NIX_SSL_CERT_FILE && exists(env.NIX_SSL_CERT_FILE)) return env.NIX_SSL_CERT_FILE;
+	for (const candidate of DEFAULT_CA_BUNDLE_PATHS) {
+		if (exists(candidate)) return candidate;
+	}
+	return undefined;
+}
+
+export function applyDefaultTlsEnvironment(
+	baseEnv: NodeJS.ProcessEnv = process.env,
+	exists: (filePath: string) => boolean = fs.existsSync,
+): NodeJS.ProcessEnv {
+	const env = { ...baseEnv };
+	if (!env.SSL_CERT_FILE) {
+		const certFile = resolveDefaultSslCertFile(env, exists);
+		if (certFile) env.SSL_CERT_FILE = certFile;
+	}
+	return env;
+}
 export class AntigravityProcess {
 	readonly generation = nextGeneration++;
 	readonly child: ChildProcessWithoutNullStreams;
@@ -52,10 +100,11 @@ export class AntigravityProcess {
 			command = options.command;
 			args = options.args ?? [];
 		} else {
+			const nodeBinary = resolveNodeBinary(options.env?.NODE);
 			const launch = options.entryPath
-				? { command: process.execPath, args: [options.entryPath, ...(options.args ?? [])] }
+				? { command: nodeBinary, args: [options.entryPath, ...(options.args ?? [])] }
 				: resolveAntigravityAcpLaunch();
-			command = process.execPath;
+			command = nodeBinary;
 			args = [resolveSupervisorEntry(), "--command", launch.command, ...launch.args];
 		}
 		let resolveExit!: (exit: ProcessExit) => void;
@@ -63,9 +112,10 @@ export class AntigravityProcess {
 			resolveExit = resolve;
 		});
 
+		const env = applyDefaultTlsEnvironment(options.env ?? process.env);
 		const child = spawn(command, args, {
 			cwd: path.resolve(options.cwd),
-			env: options.env ?? process.env,
+			env,
 			stdio: ["pipe", "pipe", "pipe"],
 			shell: false,
 			windowsHide: true,
