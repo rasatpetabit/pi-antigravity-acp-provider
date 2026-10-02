@@ -3,6 +3,7 @@ import {
 	type AssistantMessage,
 	type AssistantMessageEventStream,
 	createAssistantMessageEventStream,
+	type JsonObject,
 	type Model,
 	type StopReason,
 	type ToolCall,
@@ -54,7 +55,7 @@ export class PiEventWriter {
 		this.stream.push({ type: "thinking_delta", contentIndex: index, delta, partial: this.message });
 	}
 
-	toolCall(id: string, name: string, args: Record<string, unknown>): void {
+	toolCall(id: string, name: string, args: JsonObject): void {
 		if (this.terminal) return;
 		this.ensureStarted();
 		this.closeOpen();

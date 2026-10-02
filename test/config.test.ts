@@ -11,11 +11,11 @@ afterEach(() => {
 });
 
 describe("permission configuration", () => {
-	it("defaults to yolo and persists an explicit safer mode", () => {
+	it("defaults to the fail-closed modes and persists an explicit mode", () => {
 		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "antigravity-acp-config-"));
 		directories.push(directory);
 		const file = path.join(directory, "nested", "config.json");
-		expect(loadConfig(file)).toEqual({ permissions: "yolo", runtimeUpdates: "automatic" });
+		expect(loadConfig(file)).toEqual({ permissions: "default", runtimeUpdates: "manual" });
 		saveRuntimeUpdateMode("notify", file);
 		savePermissionMode("auto_edit", file);
 		expect(loadConfig(file)).toEqual({ permissions: "auto_edit", runtimeUpdates: "notify" });

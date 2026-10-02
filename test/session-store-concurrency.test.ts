@@ -37,7 +37,7 @@ describe("cross-process session transactions", () => {
 				const store = new AcpSessionStore(${JSON.stringify(file)});
 				const id = process.argv[1];
 				for (let i = 0; i < 12; i++) {
-					store.save({ piSessionId: id + ':' + i, acpSessionId: 'acp', acpModelId: 'model', cwd: '/tmp', messageCount: 1, historyFingerprint: 'hash', lastActive: Date.now() });
+					store.save({ schemaVersion: 2, piSessionId: id + ':' + i, acpSessionId: 'acp', acpModelId: 'model', cwd: '/tmp', messageCount: 1, historyFingerprint: 'hash', lastActive: Date.now() });
 				}
 				for (let i = 0; i < 6; i++) store.remove(id + ':' + i);
 			`;

@@ -114,8 +114,18 @@ export function inspectRuntimeSetup(): RuntimeSetupStatus {
 	};
 }
 
-export function ensureAntigravityAcpReady(onProgress?: (message: string) => void): Promise<void> {
-	inFlight ??= ensureOnce(onProgress).finally(() => {
+/**
+ * Make sure a runtime is available. Only runtimeUpdates='automatic' or an explicit setup
+ * (`install: true`, the /antigravity-acp setup route) may download; 'manual' and 'notify'
+ * never install or replace a runtime implicitly.
+ */
+export function ensureAntigravityAcpReady(
+	onProgress?: (message: string) => void,
+	options: { install?: boolean } = {},
+): Promise<void> {
+	// Explicit installs do not share an implicit check's result; installRuntime holds its own lock.
+	if (options.install) return ensureOnce(onProgress, true);
+	inFlight ??= ensureOnce(onProgress, false).finally(() => {
 		inFlight = undefined;
 	});
 	return inFlight;
@@ -164,7 +174,7 @@ export async function updateAntigravityAcpRuntime(
 	return installRuntime(release, onProgress);
 }
 
-async function ensureOnce(onProgress?: (message: string) => void): Promise<void> {
+async function ensureOnce(onProgress: ((message: string) => void) | undefined, explicit: boolean): Promise<void> {
 	configureDefaultAuth();
 	let launch: AntigravityLaunch | undefined;
 	try {
@@ -175,7 +185,14 @@ async function ensureOnce(onProgress?: (message: string) => void): Promise<void>
 
 	if (launch && launch.source !== "managed") return;
 	if (launch) repairRuntimeExecutablePermissions(path.dirname(launch.command));
-	if (launch && loadConfig().runtimeUpdates !== "automatic") return;
+	const updates = loadConfig().runtimeUpdates;
+	if (launch && updates !== "automatic") return;
+	if (!launch && !explicit && updates !== "automatic") {
+		throw new AntigravityAcpError(
+			"spawn",
+			`Antigravity ACP runtime is not installed and runtime updates are '${updates}', so it will not be downloaded implicitly. Run '/antigravity-acp setup' to install the signed runtime.`,
+		);
+	}
 
 	let resolved: Awaited<ReturnType<typeof resolveLatestRelease>>;
 	try {

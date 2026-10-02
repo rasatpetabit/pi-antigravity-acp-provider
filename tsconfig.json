@@ -9,7 +9,31 @@
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "types": ["node", "vitest/globals"]
+    "types": [
+      "node",
+      "vitest/globals"
+    ],
+    "paths": {
+      "@earendil-works/pi-ai": [
+        "/srv/pi/releases/6d50b272/node_modules/@earendil-works/pi-ai/dist/index.d.ts"
+      ],
+      "@earendil-works/pi-agent-core": [
+        "/srv/pi/releases/6d50b272/node_modules/@earendil-works/pi-agent-core/dist/index.d.ts"
+      ],
+      "@earendil-works/pi-coding-agent": [
+        "/srv/pi/releases/6d50b272/dist/index.d.ts"
+      ],
+      "typebox": [
+        "/srv/pi/releases/6d50b272/node_modules/typebox/build/index.d.mts"
+      ],
+      "typebox/value": [
+        "/srv/pi/releases/6d50b272/node_modules/typebox/build/value/index.d.mts"
+      ]
+    }
   },
-  "include": ["extensions/**/*.ts", "src/**/*.ts", "test/**/*.ts"]
+  "include": [
+    "extensions/**/*.ts",
+    "src/**/*.ts",
+    "test/**/*.ts"
+  ]
 }

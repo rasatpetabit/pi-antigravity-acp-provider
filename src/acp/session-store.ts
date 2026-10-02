@@ -3,7 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { withStoreLock } from "./store-lock.js";
 
+/** Persisted record schema. Records without this version (pre-Pi-0.99 builds) are never restored. */
+export const SESSION_RECORD_SCHEMA_VERSION = 2;
+
 export interface SavedSessionRecord {
+	/** Records written before the Pi 0.99 transcript fingerprints lack this and are dropped. */
+	schemaVersion: typeof SESSION_RECORD_SCHEMA_VERSION;
 	piSessionId: string;
 	acpSessionId: string;
 	acpModelId: string;
@@ -76,6 +81,7 @@ function validRecord(value: unknown): value is SavedSessionRecord {
 	if (!value || typeof value !== "object") return false;
 	const record = value as Partial<SavedSessionRecord>;
 	return (
+		record.schemaVersion === SESSION_RECORD_SCHEMA_VERSION &&
 		typeof record.piSessionId === "string" &&
 		typeof record.acpSessionId === "string" &&
 		typeof record.acpModelId === "string" &&

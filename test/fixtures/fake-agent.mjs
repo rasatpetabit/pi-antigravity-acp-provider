@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import http from "node:http";
 import readline from "node:readline";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -8,11 +9,24 @@ const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity 
 const scenario = process.argv[2];
 const send = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
 let model = "auto";
-let mode = "default";
+let mode = scenario === "starts-yolo" ? "yolo" : "default";
 let permissionPromptId;
 let hangingPromptId;
 let bridgePromptId;
 let mcpServer;
+// Opt-in observation log for tests: one JSON line per ACP request the fake agent received.
+const logFile = process.env.FAKE_AGENT_LOG;
+const log = (entry) => {
+	if (logFile) fs.appendFileSync(logFile, `${JSON.stringify({ pid: process.pid, ...entry })}\n`);
+};
+const advertisedModes = (restoring) =>
+	(scenario === "no-default-mode" || (restoring && scenario === "no-default-mode-on-restore")
+		? [{ id: "yolo", name: "YOLO" }]
+		: [
+				{ id: "default", name: "Default" },
+				{ id: "auto_edit", name: "Auto Edit" },
+				{ id: "yolo", name: "YOLO" },
+			]);
 
 for await (const line of rl) {
 	if (!line.trim()) continue;
@@ -29,6 +43,16 @@ for await (const line of rl) {
 		continue;
 	}
 	const { id, method, params } = message;
+	if (method && logFile) {
+		const entry = { method };
+		if (method === "session/set_mode") entry.modeId = params.modeId;
+		if (method === "session/prompt") entry.prompt = params.prompt;
+		if (method === "session/new" || method === "session/resume" || method === "session/load") {
+			const server = params.mcpServers?.find((candidate) => candidate.type === "http");
+			entry.mcpTools = server ? await listMcpTools(server) : [];
+		}
+		log(entry);
+	}
 	if (id === "permission-1" && method === undefined && permissionPromptId !== undefined) {
 		const decision = message.result?.outcome?.outcome ?? "cancelled";
 		send({
@@ -122,14 +146,7 @@ for await (const line of rl) {
 			id,
 			result: {
 				sessionId: "fake-session",
-				modes: {
-					currentModeId: mode,
-					availableModes: [
-						{ id: "default", name: "Default" },
-						{ id: "auto_edit", name: "Auto Edit" },
-						{ id: "yolo", name: "YOLO" },
-					],
-				},
+				modes: { currentModeId: mode, availableModes: advertisedModes(false) },
 				models: {
 					currentModelId: model,
 					availableModels: [
@@ -144,14 +161,7 @@ for await (const line of rl) {
 			jsonrpc: "2.0",
 			id,
 			result: {
-				modes: {
-					currentModeId: mode,
-					availableModes: [
-						{ id: "default", name: "Default" },
-						{ id: "auto_edit", name: "Auto Edit" },
-						{ id: "yolo", name: "YOLO" },
-					],
-				},
+				modes: { currentModeId: mode, availableModes: advertisedModes(true) },
 				models: { currentModelId: model, availableModels: [] },
 			},
 		});
@@ -234,6 +244,18 @@ for await (const line of rl) {
 		});
 	} else {
 		send({ jsonrpc: "2.0", id, error: { code: -32601, message: `Unknown method ${method}` } });
+	}
+}
+
+async function listMcpTools(server) {
+	const headers = Object.fromEntries(server.headers.map((header) => [header.name, header.value]));
+	const client = new Client({ name: "fake-gemini", version: "1" }, { capabilities: {} });
+	const transport = new StreamableHTTPClientTransport(new URL(server.url), { requestInit: { headers } });
+	try {
+		await client.connect(transport);
+		return (await client.listTools()).tools.map((tool) => tool.name).sort();
+	} finally {
+		await client.close();
 	}
 }
 

@@ -1,6 +1,6 @@
 # Runtime updates
 
-The provider installs Google Antigravity ACP separately from the npm package. Managed installations default to automatic runtime updates and check at most once every 24 hours when Antigravity is first used. External executables selected through `AGY_ACP_BIN`, `~/.local/bin`, or `PATH` are never replaced.
+The provider installs Google Antigravity ACP separately from the npm package. Runtime updates default to `manual`. In `automatic` mode, managed installations check at most once every 24 hours when Antigravity is first used. External executables selected through `AGY_ACP_BIN`, `~/.local/bin`, or `PATH` are never replaced.
 
 ## Trust model
 
@@ -27,8 +27,8 @@ This follows the important installation properties used by T3 Code's open-source
 ```
 
 - `automatic` installs the newest signed release before opening the next managed ACP process.
-- `notify` checks and reports an available signed release without installing it.
-- `manual` performs no background update check; `/antigravity-acp update` forces one.
+- `notify` checks and reports an available signed release without installing it, and never installs a missing runtime implicitly.
+- `manual` performs no background update check and never installs a missing runtime implicitly; `/antigravity-acp setup` installs one and `/antigravity-acp update` forces an update.
 
 If the registry is unavailable, a working managed runtime remains usable. A first installation requires the official registry to be reachable; later checks may use cached registry metadata and the bundled or cached signed manifest. If the official registry is newer than the signed catalog, installation waits for the catalog automation instead of running an unverified artifact.
 

@@ -1,4 +1,4 @@
-import type { Context, Model } from "@earendil-works/pi-ai";
+import { type Context, type Model, normalizeContext } from "@earendil-works/pi-ai";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -107,7 +107,8 @@ describe("AntigravityRuntime", () => {
 				systemPrompt: "Be useful",
 				messages: [{ role: "user", content: "hello", timestamp: Date.now() }],
 			};
-			const writer = runtime.stream(model, context, { sessionId: "pi-session", apiKey: "test-key" });
+			const transcript = normalizeContext(context);
+			const writer = runtime.stream(model, transcript, { sessionId: "pi-session", apiKey: "test-key" });
 			const events = [];
 			for await (const event of writer.stream) events.push(event);
 			expect(events.map((event) => event.type)).toEqual([
@@ -127,21 +128,23 @@ describe("AntigravityRuntime", () => {
 			});
 			const snapshot = await runtime.snapshot();
 			expect(snapshot.bindings).toBe(1);
-			expect(snapshot.permissionMode).toBe("yolo");
+			// The runtime now fails closed to 'default' when no mode is configured.
+			expect(snapshot.permissionMode).toBe("default");
 			expect(snapshot.processes[0]).toMatchObject({ modelId: "gemini-test", alive: true });
-			await runtime.setPermissionMode("default");
-			expect((await runtime.snapshot()).permissionMode).toBe("default");
+			await runtime.setPermissionMode("auto_edit");
+			expect((await runtime.snapshot()).permissionMode).toBe("auto_edit");
 			if (done?.type !== "done") throw new Error("missing first turn");
 			const switchedModel = { ...model, id: "auto", name: "Auto" };
 			const second = runtime.stream(
 				switchedModel,
-				{
+				// Pi keeps the leading system message in the transcript across turns.
+				normalizeContext({
 					messages: [
-						...context.messages,
+						...transcript.messages,
 						done.message,
 						{ role: "user", content: "second turn", timestamp: Date.now() },
 					],
-				},
+				}),
 				{ sessionId: "pi-session", apiKey: "test-key" },
 			);
 			for await (const _event of second.stream) void _event;
@@ -165,7 +168,7 @@ describe("AntigravityRuntime", () => {
 			const firstContext: Context = {
 				messages: [{ role: "user", content: "first", timestamp: 1 }],
 			};
-			const first = firstRuntime.stream(model, firstContext, { sessionId: "persisted", apiKey: "test-key" });
+			const first = firstRuntime.stream(model, normalizeContext(firstContext), { sessionId: "persisted", apiKey: "test-key" });
 			const firstEvents = [];
 			for await (const event of first.stream) firstEvents.push(event);
 			const done = firstEvents.at(-1);
@@ -176,13 +179,13 @@ describe("AntigravityRuntime", () => {
 			try {
 				const second = secondRuntime.stream(
 					model,
-					{
+					normalizeContext({
 						messages: [
 							...firstContext.messages,
 							done.message,
 							{ role: "user", content: "second", timestamp: 2 },
 						],
-					},
+					}),
 					{ sessionId: "persisted", apiKey: "test-key" },
 				);
 				for await (const _event of second.stream) void _event;
@@ -203,7 +206,7 @@ describe("AntigravityRuntime", () => {
 		try {
 			const first = runtime.stream(
 				model,
-				{ messages: [{ role: "user", content: "original", timestamp: 1 }] },
+				normalizeContext({ messages: [{ role: "user", content: "original", timestamp: 1 }] }),
 				{ sessionId: "rewind-session", apiKey: "test-key" },
 			);
 			for await (const _event of first.stream) void _event;
@@ -211,12 +214,12 @@ describe("AntigravityRuntime", () => {
 
 			const second = runtime.stream(
 				model,
-				{
+				normalizeContext({
 					messages: [
 						{ role: "user", content: "changed", timestamp: 1 },
 						{ role: "user", content: "continue", timestamp: 2 },
 					],
-				},
+				}),
 				{ sessionId: "rewind-session", apiKey: "test-key" },
 			);
 			for await (const _event of second.stream) void _event;
@@ -235,7 +238,7 @@ describe("AntigravityRuntime", () => {
 			const firstContext: Context = {
 				messages: [{ role: "user", content: "request permission", timestamp: 1 }],
 			};
-			const firstWriter = runtime.stream(model, firstContext, {
+			const firstWriter = runtime.stream(model, normalizeContext(firstContext), {
 				sessionId: "permission-session",
 				apiKey: "test-key",
 			});
@@ -275,7 +278,7 @@ describe("AntigravityRuntime", () => {
 					},
 				],
 			};
-			const secondWriter = runtime.stream(model, resumedContext, {
+			const secondWriter = runtime.stream(model, normalizeContext(resumedContext), {
 				sessionId: "permission-session",
 				apiKey: "test-key",
 			});
@@ -307,7 +310,7 @@ describe("AntigravityRuntime", () => {
 				messages: [{ role: "user", content: "use bridge", timestamp: 1 }],
 				tools,
 			};
-			const firstWriter = runtime.stream(model, firstContext, { apiKey: "test-key" });
+			const firstWriter = runtime.stream(model, normalizeContext(firstContext), { apiKey: "test-key" });
 			const firstEvents = [];
 			for await (const event of firstWriter.stream) firstEvents.push(event);
 			const firstDone = firstEvents.at(-1);
@@ -319,7 +322,7 @@ describe("AntigravityRuntime", () => {
 
 			const secondWriter = runtime.stream(
 				model,
-				{
+				normalizeContext({
 					tools,
 					messages: [
 						...firstContext.messages,
@@ -333,7 +336,7 @@ describe("AntigravityRuntime", () => {
 							timestamp: 2,
 						},
 					],
-				},
+				}),
 				{ apiKey: "test-key" },
 			);
 			const secondEvents = [];
@@ -357,7 +360,7 @@ describe("AntigravityRuntime", () => {
 				tools,
 				messages: [{ role: "user", content: "use bridge parallel", timestamp: 1 }],
 			};
-			const first = runtime.stream(model, firstContext, {
+			const first = runtime.stream(model, normalizeContext(firstContext), {
 				sessionId: "parallel-session",
 				apiKey: "test-key",
 			});
@@ -378,10 +381,10 @@ describe("AntigravityRuntime", () => {
 			}));
 			const second = runtime.stream(
 				model,
-				{
+				normalizeContext({
 					tools,
 					messages: [...firstContext.messages, firstDone.message, ...toolResults],
-				},
+				}),
 				{ sessionId: "parallel-session", apiKey: "test-key" },
 			);
 			for await (const _event of second.stream) void _event;
@@ -403,7 +406,7 @@ describe("AntigravityRuntime", () => {
 				tools,
 				messages: [{ role: "user", content: "use bridge delayed", timestamp: 1 }],
 			};
-			const first = runtime.stream(model, firstContext, {
+			const first = runtime.stream(model, normalizeContext(firstContext), {
 				sessionId: "continuation-abort",
 				apiKey: "test-key",
 			});
@@ -417,7 +420,7 @@ describe("AntigravityRuntime", () => {
 			const controller = new AbortController();
 			const second = runtime.stream(
 				model,
-				{
+				normalizeContext({
 					tools,
 					messages: [
 						...firstContext.messages,
@@ -431,7 +434,7 @@ describe("AntigravityRuntime", () => {
 							timestamp: 2,
 						},
 					],
-				},
+				}),
 				{ sessionId: "continuation-abort", apiKey: "test-key", signal: controller.signal },
 			);
 			setTimeout(() => controller.abort(), 30);
@@ -452,7 +455,7 @@ describe("AntigravityRuntime", () => {
 			const controller = new AbortController();
 			const writer = runtime.stream(
 				model,
-				{ messages: [{ role: "user", content: "hang", timestamp: 1 }] },
+				normalizeContext({ messages: [{ role: "user", content: "hang", timestamp: 1 }] }),
 				{ sessionId: "abort-session", apiKey: "test-key", signal: controller.signal },
 			);
 			await runtime.snapshot();

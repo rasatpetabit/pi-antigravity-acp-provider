@@ -32,19 +32,35 @@ export interface PiToolInvocation {
 	arguments: Record<string, unknown>;
 }
 
+/** A Pi tool that is active but not exposed to Antigravity, and why. */
+export interface ToolOmission {
+	name: string;
+	reason: string;
+}
+
 export interface PiMcpBridgeOptions {
 	tools: readonly Tool[];
 	onCall: (invocation: PiToolInvocation) => Promise<CallToolResult>;
 }
 
 export function piToolFingerprint(tools: readonly Tool[]): string {
-	const projected = projectTools(tools, []);
-	return JSON.stringify(projected.map((tool) => [tool.mcpName, tool.inputSchema]));
+	return fingerprintOf(projectTools(tools, []));
+}
+
+/** The projection Antigravity would receive for these Pi tools, with every omission named. */
+export function planToolProjection(tools: readonly Tool[]): { projected: string[]; omissions: ToolOmission[] } {
+	const omissions: ToolOmission[] = [];
+	const projected = projectTools(tools, omissions).map((tool) => tool.piName);
+	return { projected, omissions };
+}
+
+function fingerprintOf(tools: readonly BridgeTool[]): string {
+	return JSON.stringify(tools.map((tool) => [tool.mcpName, tool.description, tool.inputSchema]));
 }
 
 export class PiMcpBridge {
 	readonly fingerprint: string;
-	readonly omissions: string[] = [];
+	readonly omissions: ToolOmission[] = [];
 	private readonly token = crypto.randomUUID().replaceAll("-", "");
 	private readonly tools: BridgeTool[];
 	private server: ReturnType<typeof createServer> | undefined;
@@ -52,7 +68,7 @@ export class PiMcpBridge {
 
 	constructor(private readonly options: PiMcpBridgeOptions) {
 		this.tools = projectTools(options.tools, this.omissions);
-		this.fingerprint = JSON.stringify(this.tools.map((tool) => [tool.mcpName, tool.inputSchema]));
+		this.fingerprint = fingerprintOf(this.tools);
 	}
 
 	get empty(): boolean {
@@ -146,18 +162,19 @@ export class PiMcpBridge {
 	}
 }
 
-function projectTools(tools: readonly Tool[], omissions: string[]): BridgeTool[] {
+function projectTools(tools: readonly Tool[], omissions: ToolOmission[]): BridgeTool[] {
 	const output: BridgeTool[] = [];
 	const names = new Set<string>();
 	for (const tool of tools) {
-		if (output.length >= MAX_TOOLS) {
-			omissions.push(`Tool limit ${MAX_TOOLS} reached`);
-			break;
-		}
+		// The permission broker is Pi-side only and is never offered to Antigravity.
 		if (tool.name === PERMISSION_TOOL_NAME) continue;
+		if (output.length >= MAX_TOOLS) {
+			omissions.push({ name: tool.name, reason: `tool limit ${MAX_TOOLS} reached` });
+			continue;
+		}
 		const mcpName = `pi_${tool.name}`.replace(/[^a-zA-Z0-9_-]/gu, "_").slice(0, 64);
 		if (!mcpName || names.has(mcpName)) {
-			omissions.push(`${tool.name}: duplicate or invalid projected name`);
+			omissions.push({ name: tool.name, reason: `projected name ${mcpName} collides or is invalid` });
 			continue;
 		}
 		const inputSchema = sanitizeSchema(tool.parameters);
@@ -166,7 +183,7 @@ function projectTools(tools: readonly Tool[], omissions: string[]): BridgeTool[]
 			inputSchema.type !== "object" ||
 			JSON.stringify(inputSchema).length > SCHEMA_LIMIT
 		) {
-			omissions.push(`${tool.name}: schema must be a supported, bounded object`);
+			omissions.push({ name: tool.name, reason: "schema must be a supported, bounded object" });
 			continue;
 		}
 		names.add(mcpName);

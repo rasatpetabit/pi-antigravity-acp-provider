@@ -11,7 +11,7 @@ A first-class [Pi](https://github.com/earendil-works/pi) provider for **Google A
 - Collapses Antigravity's effort-qualified IDs into one entry per model; Pi's Shift+Tab reasoning control selects low/medium/high dynamically.
 - Supports Pi streaming, cancellation, usage/quota metadata, lifecycle cleanup, and persisted ACP session restoration across Pi restarts.
 - Routes compatible Pi tools through an authenticated loopback MCP bridge.
-- Supports persisted `default`, `auto-edit`, and `yolo` Antigravity permission modes. The requested default is `yolo`; switching to a prompting mode retains the single-use, fail-closed Pi permission broker.
+- Supports persisted `default`, `auto-edit`, and `yolo` Antigravity permission modes. The default is `default` (ask before sensitive operations), and a session that does not advertise and apply the configured mode is refused before any prompt; the single-use, fail-closed Pi permission broker handles the prompts.
 - Advertises no ACP filesystem or terminal client capabilities.
 - Provides setup, auth-health, logout/account-switching, qualification, quota, and runtime-update commands.
 - Automatically checks for newer managed ACP runtimes once per day, with `automatic`, `notify`, and `manual` update modes.
@@ -37,7 +37,7 @@ pi --no-extensions -e ./extensions/index.ts
 
 In Pi:
 
-1. Optionally run `/antigravity-acp setup` for a runtime/auth preflight.
+1. Run `/antigravity-acp setup` to install the signed runtime (required while runtime updates are `manual` or `notify`, which never download implicitly) and for a runtime/auth preflight.
 2. Run `/login`.
 3. Choose **Sign in with an account**.
 4. Choose **Google Antigravity (ACP)**.
@@ -46,7 +46,7 @@ In Pi:
 7. Run `/antigravity-acp setup` again to perform a network auth probe and model discovery.
 8. Run `/model` and select one of the `antigravity-acp` models.
 9. Press **Shift+Tab** to choose the reasoning effort. Flash models expose low, medium, and high; Pro exposes only the tiers advertised by Antigravity.
-10. Send a prompt. The default permission mode is `yolo`, so Antigravity-native commands and edits can run without confirmation.
+10. Send a prompt. The default permission mode is `default`, so Antigravity asks before sensitive commands and edits.
 
 The provider first looks at `AGY_ACP_BIN`, then its verified managed `~/.local/opt/agy-acp/current/` release, `~/.local/bin/agy_acp_server.par`, and `PATH`. Set `AGY_ACP_BIN` to explicitly prefer an externally managed runtime. If absent, it installs the platform build published in the ACP registry. A global `agy` or `gemini` command is not required.
 
@@ -86,7 +86,7 @@ Antigravity owns OAuth tokens under `~/.gemini/antigravity-acp/`; Pi stores only
 /antigravity-acp permissions yolo
 ```
 
-Permission and runtime-update modes are saved in `~/.pi/agent/antigravity-acp-provider/config.json`. Runtime updates default to `automatic`; only provider-managed installations are replaced. ACP session bindings are saved beside the config in `sessions.json`.
+Permission and runtime-update modes are saved in `~/.pi/agent/antigravity-acp-provider/config.json`. Runtime updates default to `manual`; only `automatic` or an explicit `/antigravity-acp setup`/`update` downloads a runtime, and only provider-managed installations are replaced. A missing, corrupt or unrecognized config file falls back to `default`/`manual`; a legacy `gemini-acp-provider` config migrates only its `runtimeUpdates`. ACP session bindings are saved beside the config in `sessions.json`.
 
 `logout`/`account` clears local Antigravity credentials and saved ACP sessions. Run Pi's `/logout` afterward to remove the Pi credential marker, then `/login` for the new account. `update` checks the official registry and installs its newest release only after matching it to the provider's signed runtime catalog. See [`docs/RUNTIME-UPDATES.md`](docs/RUNTIME-UPDATES.md).
 
@@ -107,7 +107,7 @@ ACP_RUNTIME_MANIFEST_PRIVATE_KEY_PATH=/secure/key.pem npm run sign:runtime-manif
 
 ## Security boundary
 
-This launches a full coding agent with the user's OS privileges. **The default `yolo` mode permits Antigravity-native commands and edits without confirmation.** Use `/antigravity-acp permissions default` for confirmation prompts. Disabling ACP filesystem/terminal **client callbacks is not a sandbox** for Antigravity-native tools. Pi hooks govern tools routed through the `pi_` MCP namespace; Antigravity-native tools remain governed by Antigravity policy and ACP permission requests.
+This launches a full coding agent with the user's OS privileges. **The `yolo` mode permits Antigravity-native commands and edits without confirmation**; the default is `default`, which prompts. Disabling ACP filesystem/terminal **client callbacks is not a sandbox** for Antigravity-native tools. Pi hooks govern tools routed through the `pi_` MCP namespace; Antigravity-native tools remain governed by Antigravity policy and ACP permission requests.
 
 ## Compatibility
 

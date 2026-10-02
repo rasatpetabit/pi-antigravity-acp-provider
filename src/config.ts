@@ -28,14 +28,22 @@ export function loadConfig(file = CONFIG_PATH): AntigravityAcpConfig {
 			runtimeUpdates?: unknown;
 		};
 		return {
-			permissions: isPermissionMode(parsed.permissions) ? parsed.permissions : "yolo",
-			runtimeUpdates: isRuntimeUpdateMode(parsed.runtimeUpdates) ? parsed.runtimeUpdates : "automatic",
+			permissions: isPermissionMode(parsed.permissions) ? parsed.permissions : DEFAULT_CONFIG.permissions,
+			runtimeUpdates: isRuntimeUpdateMode(parsed.runtimeUpdates)
+				? parsed.runtimeUpdates
+				: DEFAULT_CONFIG.runtimeUpdates,
 		};
 	} catch {
-		// Missing or malformed configuration uses the documented defaults.
+		// Missing or malformed configuration fails closed to the safe defaults.
 	}
-	return { permissions: "yolo", runtimeUpdates: "automatic" };
+	return { ...DEFAULT_CONFIG };
 }
+
+/** Fail-closed defaults: ask before tool actions, never self-update the runtime. */
+export const DEFAULT_CONFIG: Readonly<AntigravityAcpConfig> = Object.freeze({
+	permissions: "default",
+	runtimeUpdates: "manual",
+});
 
 export function savePermissionMode(mode: PermissionMode, file = CONFIG_PATH): void {
 	writeConfig({ ...loadConfig(file), permissions: mode }, file);
@@ -53,14 +61,31 @@ function writeConfig(config: AntigravityAcpConfig, file: string): void {
 	fs.renameSync(temporary, file);
 }
 
-function migrateLegacyConfig(): void {
-	if (fs.existsSync(CONFIG_PATH) || !fs.existsSync(LEGACY_CONFIG_PATH)) return;
+/**
+ * Migrate the legacy gemini-acp-provider config. Only runtimeUpdates is carried over (validated);
+ * permissions is never inherited, because a legacy 'yolo' or 'auto_edit' must not be adopted
+ * silently. The migrated file always starts at permissions='default'.
+ */
+export function migrateLegacyConfig(target = CONFIG_PATH, legacy = LEGACY_CONFIG_PATH): void {
+	if (fs.existsSync(target) || !fs.existsSync(legacy)) return;
 	try {
-		fs.mkdirSync(CONFIG_ROOT, { recursive: true, mode: 0o700 });
-		fs.copyFileSync(LEGACY_CONFIG_PATH, CONFIG_PATH, fs.constants.COPYFILE_EXCL);
-		fs.chmodSync(CONFIG_PATH, 0o600);
+		const legacyConfig = loadConfig(legacy);
+		fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+		const temporary = `${target}.${process.pid}.tmp`;
+		try {
+			fs.writeFileSync(
+				temporary,
+				`${JSON.stringify({ permissions: DEFAULT_CONFIG.permissions, runtimeUpdates: legacyConfig.runtimeUpdates }, null, 2)}\n`,
+				{ mode: 0o600 },
+			);
+			// link() publishes atomically and fails if a concurrent writer already created the
+			// target; rename() would silently overwrite that newer config.
+			fs.linkSync(temporary, target);
+		} finally {
+			fs.rmSync(temporary, { force: true });
+		}
 	} catch {
-		// Migration is best-effort; defaults remain available.
+		// Migration is best-effort; fail-closed defaults remain available.
 	}
 }
 

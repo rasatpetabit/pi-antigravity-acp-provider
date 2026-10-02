@@ -133,9 +133,9 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 				let requested = command.slice("permissions".length).trim().replaceAll("-", "_");
 				if (!requested) {
 					const choices = [
-						"yolo — allow commands and edits automatically (default)",
+						"default — ask before sensitive operations (default)",
 						"auto-edit — allow edits automatically; commands may ask",
-						"default — ask before sensitive operations",
+						"yolo — allow commands and edits automatically",
 					];
 					const selected = await ctx.ui.select("Antigravity permission mode", choices);
 					if (!selected) return;
@@ -188,6 +188,11 @@ export default function antigravityAcpExtension(pi: ExtensionAPI): void {
 					formatMetrics(snapshot.metrics),
 					...snapshot.processes.flatMap((item) => [
 						`• pid=${item.pid ?? "?"} generation=${item.generation} model=${item.modelId} alive=${item.alive} restored=${item.restored} agent=${item.agentVersion ?? "?"} mcpHttp=${item.mcpHttp} permission=${item.waitingForPermission} tools=${item.waitingForTools} ignoredStdoutNoise=${item.ignoredStdoutNoiseLines}`,
+						...(item.omittedTools.length > 0
+							? [
+									`  omitted Pi tools: ${item.omittedTools.map((omission) => `${omission.name} (${omission.reason})`).join("; ")}`,
+								]
+							: ["  omitted Pi tools: none"]),
 						...(verbose && item.stderrTail ? [`  stderr (redacted): ${item.stderrTail}`] : []),
 					]),
 				].join("\n"),

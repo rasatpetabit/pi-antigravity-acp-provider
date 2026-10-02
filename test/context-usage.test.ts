@@ -1,4 +1,4 @@
-import type { Context } from "@earendil-works/pi-ai";
+import { type Context, normalizeContext } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 
 import { buildPromptParts } from "../src/stream/context.js";
@@ -24,8 +24,8 @@ describe("prompt context", () => {
 				{ role: "user", content: "new", timestamp: 3 },
 			],
 		};
-		const fresh = buildPromptParts(context, true);
-		const warm = buildPromptParts(context, false);
+		const fresh = buildPromptParts(normalizeContext(context), true);
+		const warm = buildPromptParts(normalizeContext(context), false);
 		expect(fresh.prompt).toHaveLength(2);
 		expect(fresh.prompt[0]?.type).toBe("resource");
 		expect(warm.prompt).toEqual([{ type: "text", text: "new" }]);
@@ -55,7 +55,7 @@ describe("prompt context", () => {
 				},
 			],
 		};
-		const result = buildPromptParts(context, true);
+		const result = buildPromptParts(normalizeContext(context), true);
 		expect(result.prompt).toHaveLength(2);
 		expect(result.prompt[0]).toMatchObject({
 			type: "resource",
@@ -72,7 +72,7 @@ describe("prompt context", () => {
 				{ role: "user", content: "current", timestamp: 3 },
 			],
 		};
-		const result = buildPromptParts(context, false, 1);
+		const result = buildPromptParts(normalizeContext(context), false, 1);
 		expect(result.prompt).toHaveLength(2);
 		expect(result.prompt[0]).toMatchObject({
 			type: "resource",

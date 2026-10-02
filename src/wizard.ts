@@ -11,7 +11,7 @@ export async function runSetupWizard(
 	runtime: AntigravityRuntime,
 ): Promise<void> {
 	ui.notify("Checking Antigravity ACP runtime…", "info");
-	await ensureAntigravityAcpReady((message) => ui.notify(message, "info"));
+	await ensureAntigravityAcpReady((message) => ui.notify(message, "info"), { install: true });
 	const setup = inspectRuntimeSetup();
 	let localAuth = inspectAntigravityAuth();
 	if (localAuth.status !== "oauth-refreshable" && localAuth.status !== "api-key-env") {

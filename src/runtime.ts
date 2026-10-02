@@ -7,7 +7,17 @@ import type {
 	RequestPermissionResponse,
 	SessionNotification,
 } from "@agentclientprotocol/sdk";
-import type { Context, Model, SimpleStreamOptions, ToolResultMessage } from "@earendil-works/pi-ai";
+import {
+	getCurrentTools,
+	toToolDeclaration,
+	type JsonObject,
+	type Message,
+	type Model,
+	type SimpleStreamOptions,
+	type Tool,
+	type ToolResultMessage,
+	type TranscriptContext,
+} from "@earendil-works/pi-ai";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { createHash } from "node:crypto";
 
@@ -18,11 +28,12 @@ import {
 } from "./acp/antigravity.js";
 import { AntigravityAcpConnection, type AntigravityConnectionOptions } from "./acp/connection.js";
 import { abortError, AntigravityAcpError, errorMessage } from "./acp/errors.js";
-import { AcpSessionStore } from "./acp/session-store.js";
+import { AcpSessionStore, SESSION_RECORD_SCHEMA_VERSION } from "./acp/session-store.js";
 import {
 	MANAGED_AUTH_MARKER,
 	PERMISSION_RESULT_KIND,
 	PERMISSION_TOOL_NAME,
+	REQUIRED_BRIDGE_TOOLS,
 } from "./constants.js";
 export { MANAGED_AUTH_MARKER, PERMISSION_RESULT_KIND, PERMISSION_TOOL_NAME } from "./constants.js";
 import { mapSessionUpdate } from "./acp/events.js";
@@ -31,11 +42,13 @@ import { HeadlessOAuthRelay, shouldUseHeadlessOAuth } from "./acp/headless-oauth
 import {
 	PiMcpBridge,
 	piToolFingerprint,
+	planToolProjection,
 	type PiToolInvocation,
+	type ToolOmission,
 } from "./mcp/bridge.js";
-import type { PermissionMode } from "./config.js";
+import { DEFAULT_CONFIG, type PermissionMode } from "./config.js";
 import { resolveAcpModelId } from "./models.js";
-import { type PromptParts, buildPromptParts } from "./stream/context.js";
+import { type PromptParts, buildPromptParts, renderInstructionUpdates } from "./stream/context.js";
 import { PiEventWriter } from "./stream/pi-events.js";
 import { usageFromPrompt } from "./stream/usage.js";
 import { RuntimeMetrics } from "./status.js";
@@ -78,6 +91,9 @@ interface Binding {
 	toolBatchTimer: ReturnType<typeof setTimeout> | undefined;
 	bridge: PiMcpBridge | undefined;
 	toolFingerprint: string;
+	omittedTools: ToolOmission[];
+	/** Instruction updates Pi added while a running ACP prompt was resumed; sent on the next prompt. */
+	deferredInstructions: string[];
 	turnCompletion: Promise<void> | undefined;
 	abortRequested: boolean;
 	piSessionId: string | undefined;
@@ -118,6 +134,7 @@ export interface RuntimeSnapshot {
 		agentVersion: string | undefined;
 		mcpHttp: boolean;
 		restored: boolean;
+		omittedTools: ToolOmission[];
 		ignoredStdoutNoiseLines: number;
 		stderrTail?: string;
 	}>;
@@ -138,7 +155,7 @@ export class AntigravityRuntime {
 
 	constructor(
 		connectionFactory?: AntigravityConnectionFactory,
-		permissionMode: PermissionMode = "yolo",
+		permissionMode: PermissionMode = DEFAULT_CONFIG.permissions,
 		sessionStore?: AcpSessionStore,
 	) {
 		this.connectionFactory = connectionFactory ?? ((options) => new AntigravityAcpConnection(options));
@@ -147,7 +164,7 @@ export class AntigravityRuntime {
 		this.sessionStore = sessionStore ?? (this.ensureAgent ? new AcpSessionStore() : undefined);
 	}
 
-	stream(model: AntigravityModel, context: Context, options: SimpleStreamOptions = {}): PiEventWriter {
+	stream(model: AntigravityModel, context: TranscriptContext, options: SimpleStreamOptions = {}): PiEventWriter {
 		const writer = new PiEventWriter(model);
 		void this.runQueued(model, context, options, writer).catch((error: unknown) => {
 			writer.fail(error, options.signal?.aborted === true || isAbort(error));
@@ -300,6 +317,7 @@ export class AntigravityRuntime {
 					agentVersion: binding.initialize.agentInfo?.version,
 					mcpHttp: binding.initialize.agentCapabilities?.mcpCapabilities?.http === true,
 					restored: binding.restored,
+					omittedTools: binding.omittedTools,
 					ignoredStdoutNoiseLines: binding.connection.process.ignoredStdoutNoiseLines,
 					...(includeStderr ? { stderrTail: binding.connection.process.stderrTail } : {}),
 				};
@@ -340,7 +358,7 @@ export class AntigravityRuntime {
 
 	private async runQueued(
 		model: AntigravityModel,
-		context: Context,
+		context: TranscriptContext,
 		options: SimpleStreamOptions,
 		writer: PiEventWriter,
 	): Promise<void> {
@@ -350,7 +368,8 @@ export class AntigravityRuntime {
 		const key = options.sessionId
 			? `sid:${options.sessionId}`
 			: (this.findContinuationKey(context) ?? `ephemeral:${crypto.randomUUID()}`);
-		const tools = context.tools ?? [];
+		// Pi 0.99 carries the tool set as system-message deltas, not Context.tools.
+		const tools = getCurrentTools(context.messages);
 		const acpModelId = resolveAcpModelId(model, options.reasoning);
 		let binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 
@@ -365,6 +384,7 @@ export class AntigravityRuntime {
 				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 			} else {
 				binding.writer = writer;
+				deferInstructionUpdates(binding, context);
 				binding.pendingContextCount = context.messages.length;
 				binding.pendingContextFingerprint = messagesFingerprint(context.messages);
 				binding.permission = undefined;
@@ -394,6 +414,7 @@ export class AntigravityRuntime {
 				binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 			} else {
 				binding.writer = writer;
+				deferInstructionUpdates(binding, context);
 				binding.pendingContextCount = context.messages.length;
 				binding.pendingContextFingerprint = messagesFingerprint(context.messages);
 				for (const { pending, message } of results) {
@@ -445,8 +466,10 @@ export class AntigravityRuntime {
 			) {
 				unseenStart += 1;
 			}
+			// A fresh reconstruction already carries the full current system prompt.
+			const deferred = binding.deferredInstructions.splice(0);
 			const parts = adaptPromptToCapabilities(
-				buildPromptParts(context, fresh, unseenStart),
+				buildPromptParts(context, fresh, unseenStart, fresh ? [] : deferred),
 				binding.initialize,
 			);
 			binding.pendingContextCount = context.messages.length;
@@ -515,7 +538,7 @@ export class AntigravityRuntime {
 		}
 	}
 
-	private findContinuationKey(context: Context): string | undefined {
+	private findContinuationKey(context: TranscriptContext): string | undefined {
 		for (const binding of this.resolvedBindings) {
 			if (binding.permission && findPermissionResult(context, binding.permission.id)) return binding.key;
 			if (
@@ -536,12 +559,12 @@ export class AntigravityRuntime {
 		acpModelId: string,
 		apiKey: string | undefined,
 		writer: PiEventWriter,
-		tools: Context["tools"],
+		tools: readonly Tool[],
 		signal?: AbortSignal,
 	): Promise<Binding> {
 		const existing = this.bindings.get(key);
 		if (existing) return existing;
-		const created = this.createBinding(key, model, acpModelId, apiKey, writer, tools ?? [], signal).catch((error) => {
+		const created = this.createBinding(key, model, acpModelId, apiKey, writer, tools, signal).catch((error) => {
 			this.bindings.delete(key);
 			throw error;
 		});
@@ -555,7 +578,7 @@ export class AntigravityRuntime {
 		acpModelId: string,
 		apiKey: string | undefined,
 		writer: PiEventWriter,
-		tools: NonNullable<Context["tools"]>,
+		tools: readonly Tool[],
 		signal?: AbortSignal,
 	): Promise<Binding> {
 		const cwd = process.cwd();
@@ -571,8 +594,15 @@ export class AntigravityRuntime {
 		try {
 			const initialize = await connection.initialize();
 			await authenticateForCredential(connection, initialize, apiKey, signal);
+			const mcpHttp = initialize.agentCapabilities?.mcpCapabilities?.http === true;
+			const omittedTools = mcpHttp
+				? planToolProjection(tools).omissions
+				: tools
+						.filter((tool) => tool.name !== PERMISSION_TOOL_NAME)
+						.map((tool) => ({ name: tool.name, reason: "Antigravity did not advertise MCP over HTTP" }));
+			assertRequiredToolsProjected(omittedTools);
 			let mcpServer;
-			if (tools.length > 0 && initialize.agentCapabilities?.mcpCapabilities?.http === true) {
+			if (tools.length > 0 && mcpHttp) {
 				bridge = new PiMcpBridge({
 					tools,
 					onCall: (invocation) => this.requestPiTool(binding, invocation),
@@ -605,7 +635,15 @@ export class AntigravityRuntime {
 				}
 			}
 			session ??= await connection.newSession(cwd, signal, mcpServers);
-			if (supportsMode(session, this.permissionMode) && session.modes?.currentModeId !== this.permissionMode) {
+			// Fail closed on new and restored sessions alike: never prompt in an unconfirmed mode.
+			if (!supportsMode(session, this.permissionMode)) {
+				if (restored && piSessionId) this.sessionStore?.remove(piSessionId);
+				throw new AntigravityAcpError(
+					"protocol",
+					`Antigravity ${restored ? "restored" : "new"} session did not advertise permission mode '${this.permissionMode}'; refusing the session`,
+				);
+			}
+			if (session.modes?.currentModeId !== this.permissionMode) {
 				await connection.setMode(session.sessionId, this.permissionMode, signal);
 			}
 			const currentModel = session.models?.currentModelId;
@@ -629,6 +667,8 @@ export class AntigravityRuntime {
 				toolBatchTimer: undefined,
 				bridge,
 				toolFingerprint: piToolFingerprint(tools),
+				omittedTools,
+				deferredInstructions: [],
 				turnCompletion: undefined,
 				abortRequested: false,
 				piSessionId,
@@ -653,6 +693,7 @@ export class AntigravityRuntime {
 	private persistBinding(binding: Binding): void {
 		if (!binding.piSessionId) return;
 		this.sessionStore?.save({
+			schemaVersion: SESSION_RECORD_SCHEMA_VERSION,
 			piSessionId: binding.piSessionId,
 			acpSessionId: binding.session.sessionId,
 			acpModelId: binding.modelId,
@@ -676,6 +717,13 @@ export class AntigravityRuntime {
 				isError: true,
 			});
 		}
+		const args = toJsonObject(invocation.arguments);
+		if (!args) {
+			return Promise.resolve({
+				content: [{ type: "text", text: "Tool arguments must be a plain JSON object" }],
+				isError: true,
+			});
+		}
 		return new Promise<CallToolResult>((resolve) => {
 			const timer = setTimeout(() => {
 				if (!binding.pendingTools.delete(invocation.id)) return;
@@ -683,7 +731,7 @@ export class AntigravityRuntime {
 			}, TOOL_TIMEOUT_MS);
 			timer.unref();
 			binding.pendingTools.set(invocation.id, { invocation, resolve, timer });
-			binding.writer?.toolCall(invocation.id, invocation.name, invocation.arguments);
+			binding.writer?.toolCall(invocation.id, invocation.name, args);
 			if (binding.toolBatchTimer) clearTimeout(binding.toolBatchTimer);
 			binding.toolBatchTimer = setTimeout(() => {
 				binding.toolBatchTimer = undefined;
@@ -797,7 +845,7 @@ function permissionView(permission: PendingPermission): PermissionView {
 	};
 }
 
-function findPermissionResult(context: Context, requestId: string): PermissionToolResult | undefined {
+function findPermissionResult(context: TranscriptContext, requestId: string): PermissionToolResult | undefined {
 	for (let index = context.messages.length - 1; index >= 0; index--) {
 		const message = context.messages[index];
 		if (
@@ -826,14 +874,22 @@ function findPermissionResult(context: Context, requestId: string): PermissionTo
 	return undefined;
 }
 
-function messagesFingerprint(messages: Context["messages"]): string {
+function messagesFingerprint(messages: readonly Message[]): string {
 	const fingerprints = messages.map(messageFingerprint);
 	return createHash("sha256").update(fingerprints.join("\n")).digest("hex");
 }
 
-function messageFingerprint(message: Context["messages"][number]): string {
+function messageFingerprint(message: Message): string {
 	let value: unknown;
-	if (message.role === "user") {
+	if (message.role === "system") {
+		value = {
+			role: message.role,
+			content: message.content,
+			sections: message.sections,
+			toolsAdded: message.toolsAdded?.map(toToolDeclaration),
+			toolsRemoved: message.toolsRemoved?.map((tool) => tool.name),
+		};
+	} else if (message.role === "user") {
 		value = { role: message.role, content: message.content };
 	} else if (message.role === "assistant") {
 		value = {
@@ -842,7 +898,7 @@ function messageFingerprint(message: Context["messages"][number]): string {
 			model: message.model,
 			content: message.content,
 		};
-	} else {
+	} else if (message.role === "toolResult") {
 		value = {
 			role: message.role,
 			toolCallId: message.toolCallId,
@@ -850,8 +906,52 @@ function messageFingerprint(message: Context["messages"][number]): string {
 			content: message.content,
 			isError: message.isError,
 		};
+	} else {
+		const unknownRole: never = message;
+		throw new AntigravityAcpError("invalid_input", `Unsupported Pi message role: ${JSON.stringify(unknownRole)}`);
 	}
 	return createHash("sha256").update(canonicalJson(value)).digest("hex");
+}
+
+function deferInstructionUpdates(binding: Binding, context: TranscriptContext): void {
+	const start = Math.min(binding.pendingContextCount, context.messages.length);
+	binding.deferredInstructions.push(...renderInstructionUpdates(context.messages.slice(start)));
+}
+
+function assertRequiredToolsProjected(omissions: readonly ToolOmission[]): void {
+	const missing = omissions.filter((omission) => REQUIRED_BRIDGE_TOOLS.includes(omission.name));
+	if (missing.length === 0) return;
+	throw new AntigravityAcpError(
+		"invalid_input",
+		`Required Pi tools cannot be bridged to Antigravity; refusing the session: ${missing
+			.map((omission) => `${omission.name} (${omission.reason})`)
+			.join("; ")}`,
+	);
+}
+
+/** Narrow untrusted tool arguments to a JSON object: no functions, undefined, non-finite numbers or cycles. */
+export function toJsonObject(value: unknown): JsonObject | undefined {
+	if (!isPlainObject(value)) return undefined;
+	const seen = new Set<object>();
+	const isJson = (candidate: unknown): boolean => {
+		if (candidate === null || typeof candidate === "string" || typeof candidate === "boolean") return true;
+		if (typeof candidate === "number") return Number.isFinite(candidate);
+		if (Array.isArray(candidate) || isPlainObject(candidate)) {
+			if (seen.has(candidate)) return false;
+			seen.add(candidate);
+			const ok = (Array.isArray(candidate) ? candidate : Object.values(candidate)).every(isJson);
+			seen.delete(candidate);
+			return ok;
+		}
+		return false;
+	};
+	return isJson(value) ? (value as JsonObject) : undefined;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const prototype = Object.getPrototypeOf(value) as unknown;
+	return prototype === Object.prototype || prototype === null;
 }
 
 function canonicalJson(value: unknown): string {
@@ -867,7 +967,7 @@ function canonicalJson(value: unknown): string {
 }
 
 function findToolResult(
-	context: Context,
+	context: TranscriptContext,
 	toolCallId: string,
 	toolName: string,
 ): ToolResultMessage | undefined {

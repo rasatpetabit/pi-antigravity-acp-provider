@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { AcpSessionStore } from "../src/acp/session-store.js";
+import { AcpSessionStore, SESSION_RECORD_SCHEMA_VERSION } from "../src/acp/session-store.js";
 
 const roots: string[] = [];
 afterEach(() => {
@@ -17,6 +17,7 @@ describe("AcpSessionStore", () => {
 		const file = path.join(root, "sessions.json");
 		const store = new AcpSessionStore(file);
 		store.save({
+			schemaVersion: SESSION_RECORD_SCHEMA_VERSION,
 			piSessionId: "pi-1",
 			acpSessionId: "acp-1",
 			acpModelId: "gemini-low",
