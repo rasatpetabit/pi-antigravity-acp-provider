@@ -274,7 +274,7 @@ Race handling:
 | `rate_limit` | 429 | retry later; no automatic account rotation |
 | `protocol` | malformed JSON/response | show versions; kill process; file bug |
 | `startup` | entry missing/early exit | reinstall/doctor; no PATH advice by default |
-| `timeout` | handshake/prompt idle | cancel then kill; include phase |
+| `timeout` | handshake deadline / prompt with no progress | close the process; include phase |
 | `permission` | no valid options/stale result | deny and report |
 | `filesystem` | denied path/ENOENT | bounded safe message |
 | `aborted` | user cancel | no alarming error wording |

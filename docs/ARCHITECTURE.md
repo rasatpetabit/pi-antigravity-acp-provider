@@ -119,13 +119,23 @@ Recommended deadlines (configuration may tune within safe bounds):
 | Spawn + initialize | 30 s |
 | Authenticate | 180 s; user interaction aware |
 | Session new/model/mode | 30 s |
-| Prompt idle | 120 s excluding active permission UI |
-| Prompt overall | 10 min |
+| Prompt no-progress watchdog | 10 min without inbound activity, suspended while work is outstanding |
+| Prompt overall | none; Pi abort (Esc) stops a long turn |
+| Parked bridged Pi tool call | none; ends with Pi's result, continuation without it, abort, or close |
 | Cancel grace | 1.5 s |
 | SIGTERM → SIGKILL | 1 s |
 | Idle process TTL | 10 min |
 
-All deadline timers use `unref` where possible. User login and permission UI have explicit cancellation rather than an invisible fixed wall clock. While `binding.state === "awaiting-permission"`, pause prompt-idle and process-idle eviction timers; retain only the permission expiry and overall safety deadline. A late permission result for a dead generation is handled as a normal denied/failed continuation, never an unhandled rejection.
+All deadline timers use `unref` where possible. User login and permission UI have explicit cancellation rather than an invisible fixed wall clock. A late permission result for a dead generation is handled as a normal denied/failed continuation, never an unhandled rejection.
+
+One `session/prompt` spans the whole Antigravity agent turn: native tools (a long shell command is silent while it runs), every bridged Pi tool call (Pi may run a subagent or workflow for many minutes before the next Pi turn resolves the parked call), and permission round trips. It therefore has no wall-clock deadline. `AntigravityAcpConnection` runs it under a progress watchdog (`promptIdleTimeoutMs`, default 10 min):
+
+- every `session/update` for the prompt's session and every `session/request_permission` restarts the window;
+- the watchdog cannot fire while a permission request is pending, while a tool call reported by `tool_call` has not reached `completed` or `failed`, or while the runtime holds it for a bridged Pi call parked waiting for Pi (released when the result is delivered or the call is cancelled);
+- its state lives only as long as the prompt, so a warm binding carries no holds or open tool-call ids into the next prompt;
+- when it fires, the prompt rejects with `timeout` (`session/prompt timed out: no progress for N ms`) and the connection closes. Abort keeps its own path: `session/cancel`, a 1.5 s grace, then close.
+
+A parked bridged Pi tool call has no timeout of its own. It stays parked until Pi returns its result, Pi continues without it, the turn is aborted, or the binding, process or provider closes; each of those answers it.
 
 ## 4. Startup and model publication
 
@@ -253,7 +263,7 @@ The MCP server parks calls rather than executing them internally. Requirements:
 - schemas converted losslessly or tools omitted;
 - tool list refreshed per turn;
 - no credentials exposed to Gemini;
-- per-call timeout/abort/generation checks;
+- per-call abort/generation checks; no per-call wall clock (a parked call holds the prompt watchdog until Pi answers or it is cancelled);
 - explicit collision policy with Gemini core tool names;
 - no `tools.core: []` workaround because of upstream #28361;
 - compatibility tests proving Pi marketplace tools remain visible and execute through Pi;

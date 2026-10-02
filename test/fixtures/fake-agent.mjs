@@ -182,6 +182,10 @@ for await (const line of rl) {
 		const text = params.prompt.filter((block) => block.type === "text").map((block) => block.text).join("\n");
 		if (text.includes("bridge") && mcpServer) {
 			bridgePromptId = id;
+			if (text.includes("leaky")) {
+				// A tool call that never reaches a terminal status before the prompt ends.
+				sendUpdate(params.sessionId, { sessionUpdate: "tool_call", toolCallId: "leaked-1", title: "Running pi_echo", status: "in_progress" });
+			}
 			if (text.includes("noisy")) {
 				// Tool status notifications as Antigravity sends them around a bridged MCP call and native tools.
 				const notes = [
@@ -216,6 +220,39 @@ for await (const line of rl) {
 				});
 				send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
 			});
+			continue;
+		}
+		if (text.includes("stream slow")) {
+			// Keeps making progress: one chunk every 50 ms, twelve chunks, then the end of the turn.
+			void (async () => {
+				for (let index = 0; index < 12; index += 1) {
+					await sleep(50);
+					sendUpdate(params.sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `${index},` } });
+				}
+				send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+			})();
+			continue;
+		}
+		if (text.includes("native slow")) {
+			// A silent native command: open for 800 ms with no other update, then completed.
+			sendUpdate(params.sessionId, { sessionUpdate: "tool_call", toolCallId: "native-slow", title: "sleep", status: "in_progress", kind: "execute" });
+			void sleep(800).then(() => {
+				sendUpdate(params.sessionId, { sessionUpdate: "tool_call_update", toolCallId: "native-slow", status: "completed" });
+				sendUpdate(params.sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "native done" } });
+				send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+			});
+			continue;
+		}
+		if (text.includes("tool hang")) {
+			// A native command that never finishes; only session/cancel ends the prompt.
+			hangingPromptId = id;
+			sendUpdate(params.sessionId, { sessionUpdate: "tool_call", toolCallId: "native-hang", title: "sleep", status: "in_progress", kind: "execute" });
+			continue;
+		}
+		if (text.includes("tool leak")) {
+			// The turn ends while a reported tool call never reached a terminal status.
+			sendUpdate(params.sessionId, { sessionUpdate: "tool_call", toolCallId: "native-leak", title: "sleep", status: "in_progress", kind: "execute" });
+			send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
 			continue;
 		}
 		if (text.includes("hang")) {
@@ -266,6 +303,14 @@ for await (const line of rl) {
 	} else {
 		send({ jsonrpc: "2.0", id, error: { code: -32601, message: `Unknown method ${method}` } });
 	}
+}
+
+function sendUpdate(sessionId, update) {
+	send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update } });
+}
+
+function sleep(ms) {
+	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function listMcpTools(server) {

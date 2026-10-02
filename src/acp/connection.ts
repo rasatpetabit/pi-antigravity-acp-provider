@@ -21,6 +21,12 @@ import { abortError, AntigravityAcpError, redact } from "./errors.js";
 import { AntigravityProcess, type AntigravityProcessOptions } from "./process.js";
 
 const DEFAULT_OPERATION_TIMEOUT_MS = 120_000;
+/**
+ * A session/prompt spans the whole Antigravity agent turn, including native tools and bridged Pi
+ * tool calls that run for many minutes. It is therefore bounded by progress, not wall-clock time:
+ * it fails only after this long with no inbound activity while nothing is outstanding.
+ */
+const DEFAULT_PROMPT_IDLE_TIMEOUT_MS = 10 * 60_000;
 
 export interface AntigravityConnectionHandlers {
 	onUpdate?: (notification: SessionNotification) => void | Promise<void>;
@@ -31,7 +37,92 @@ export interface AntigravityConnectionOptions extends AntigravityProcessOptions 
 	handlers?: AntigravityConnectionHandlers;
 	initializeTimeoutMs?: number;
 	operationTimeoutMs?: number;
+	/** No-progress limit for one session/prompt; see DEFAULT_PROMPT_IDLE_TIMEOUT_MS. */
+	promptIdleTimeoutMs?: number;
 	maxFrameBytes?: number;
+}
+
+/**
+ * Liveness state of one in-flight session/prompt. Any inbound activity for its session restarts
+ * the idle timer; the timer cannot fire while work is outstanding outside the model stream: a
+ * pending permission request, a tool call Antigravity reported that has not reached a terminal
+ * status, or an explicit hold (a bridged Pi tool call parked while Pi executes it). The state
+ * lives only as long as the prompt, so nothing carries over on a warm binding.
+ */
+class PromptWatchdog {
+	private timer: ReturnType<typeof setTimeout> | undefined;
+	private holds = 0;
+	private permissions = 0;
+	private readonly openToolCalls = new Set<string>();
+	private disposed = false;
+
+	constructor(
+		private readonly idleMs: number,
+		private readonly onStall: () => void,
+	) {}
+
+	get suspended(): boolean {
+		return this.holds > 0 || this.permissions > 0 || this.openToolCalls.size > 0;
+	}
+
+	/** Restart the no-progress window, or stop it while work is outstanding. */
+	arm(): void {
+		if (this.timer) clearTimeout(this.timer);
+		this.timer = undefined;
+		if (this.disposed || this.suspended) return;
+		this.timer = setTimeout(() => {
+			this.timer = undefined;
+			if (this.disposed || this.suspended) return;
+			this.onStall();
+		}, this.idleMs);
+		this.timer.unref?.();
+	}
+
+	noteUpdate(notification: SessionNotification): void {
+		const update = notification.update;
+		if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
+			const terminal = update.status === "completed" || update.status === "failed";
+			if (terminal) this.openToolCalls.delete(update.toolCallId);
+			else if (update.sessionUpdate === "tool_call") this.openToolCalls.add(update.toolCallId);
+		}
+		this.arm();
+	}
+
+	beginPermission(): () => void {
+		this.permissions += 1;
+		this.arm();
+		return this.releaser(() => {
+			this.permissions = Math.max(0, this.permissions - 1);
+		});
+	}
+
+	hold(): () => void {
+		this.holds += 1;
+		this.arm();
+		return this.releaser(() => {
+			this.holds = Math.max(0, this.holds - 1);
+		});
+	}
+
+	dispose(): void {
+		this.disposed = true;
+		if (this.timer) clearTimeout(this.timer);
+		this.timer = undefined;
+		this.holds = 0;
+		this.permissions = 0;
+		this.openToolCalls.clear();
+	}
+
+	/** An idempotent release: a second call, or a call after the prompt settled, does nothing. */
+	private releaser(decrement: () => void): () => void {
+		let released = false;
+		return () => {
+			if (released || this.disposed) return;
+			released = true;
+			decrement();
+			this.arm();
+		};
+	}
 }
 
 export class AntigravityAcpConnection {
@@ -39,6 +130,9 @@ export class AntigravityAcpConnection {
 	readonly initialized: Promise<InitializeResponse>;
 	private readonly connection: ClientSideConnection;
 	private readonly operationTimeoutMs: number;
+	private readonly promptIdleTimeoutMs: number;
+	/** The watchdog of the in-flight session/prompt, by ACP session id. */
+	private readonly promptWatchdogs = new Map<string, PromptWatchdog>();
 	private readonly protocolFailure: Promise<never>;
 	private readonly processFailure: Promise<never>;
 	private handlers: AntigravityConnectionHandlers;
@@ -47,6 +141,7 @@ export class AntigravityAcpConnection {
 	constructor(options: AntigravityConnectionOptions) {
 		this.handlers = options.handlers ?? {};
 		this.operationTimeoutMs = options.operationTimeoutMs ?? DEFAULT_OPERATION_TIMEOUT_MS;
+		this.promptIdleTimeoutMs = options.promptIdleTimeoutMs ?? DEFAULT_PROMPT_IDLE_TIMEOUT_MS;
 		this.process = new AntigravityProcess(options);
 		let rejectProtocolFailure!: (error: Error) => void;
 		this.protocolFailure = new Promise<never>((_resolve, reject) => {
@@ -77,9 +172,16 @@ export class AntigravityAcpConnection {
 		});
 		this.connection = new ClientSideConnection(
 			() => ({
-				requestPermission: async (request) =>
-					this.handlers.onPermission?.(request) ?? { outcome: { outcome: "cancelled" } },
+				requestPermission: async (request) => {
+					const release = this.promptWatchdogs.get(request.sessionId)?.beginPermission();
+					try {
+						return (await this.handlers.onPermission?.(request)) ?? { outcome: { outcome: "cancelled" } };
+					} finally {
+						release?.();
+					}
+				},
 				sessionUpdate: async (notification) => {
+					this.promptWatchdogs.get(notification.sessionId)?.noteUpdate(notification);
 					await this.handlers.onUpdate?.(notification);
 				},
 			}),
@@ -205,10 +307,19 @@ export class AntigravityAcpConnection {
 		);
 	}
 
+	/**
+	 * Suspend the in-flight prompt's no-progress watchdog for this session until the returned
+	 * release is called (idempotent). Used while a bridged Pi tool call is parked waiting for Pi.
+	 * Without an in-flight prompt this is a no-op; a release after the prompt settled does nothing.
+	 */
+	holdPromptWatchdog(sessionId: string): () => void {
+		return this.promptWatchdogs.get(sessionId)?.hold() ?? (() => undefined);
+	}
+
 	async prompt(request: PromptRequest, signal?: AbortSignal): Promise<PromptResponse> {
 		if (signal?.aborted) throw abortError();
-		const pending = this.connection.prompt(request);
-		if (!signal) return this.withDeadline(pending, 10 * 60_000, "session/prompt");
+		const pending = this.withProgressWatchdog(request);
+		if (!signal) return pending;
 
 		return new Promise<PromptResponse>((resolve, reject) => {
 			let settled = false;
@@ -230,7 +341,7 @@ export class AntigravityAcpConnection {
 				}, 1_500);
 			};
 			signal.addEventListener("abort", onAbort, { once: true });
-			this.withDeadline(pending, 10 * 60_000, "session/prompt").then(
+			pending.then(
 				(value) => {
 					if (aborting) finish(() => reject(abortError()));
 					else finish(() => resolve(value));
@@ -275,6 +386,42 @@ export class AntigravityAcpConnection {
 				},
 			);
 		});
+	}
+
+	/** Run one session/prompt under a no-progress watchdog instead of a wall-clock deadline. */
+	private async withProgressWatchdog(request: PromptRequest): Promise<PromptResponse> {
+		const idleMs = this.promptIdleTimeoutMs;
+		let rejectStall!: (error: Error) => void;
+		const stalled = new Promise<never>((_resolve, reject) => {
+			rejectStall = reject;
+		});
+		const watchdog = new PromptWatchdog(idleMs, () => {
+			void this.close();
+			rejectStall(
+				new AntigravityAcpError(
+					"timeout",
+					`Antigravity ACP session/prompt timed out: no progress for ${idleMs}ms`,
+				),
+			);
+		});
+		// Register before sending so the earliest update for this prompt is observed.
+		this.promptWatchdogs.set(request.sessionId, watchdog);
+		watchdog.arm();
+		try {
+			return await Promise.race([
+				this.connection.prompt(request).catch((error: unknown) => {
+					throw classifyError(error);
+				}),
+				this.protocolFailure,
+				this.processFailure,
+				stalled,
+			]);
+		} finally {
+			watchdog.dispose();
+			if (this.promptWatchdogs.get(request.sessionId) === watchdog) {
+				this.promptWatchdogs.delete(request.sessionId);
+			}
+		}
 	}
 
 	private async withDeadline<T>(promise: Promise<T>, timeoutMs: number, phase: string): Promise<T> {

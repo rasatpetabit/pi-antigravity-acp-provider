@@ -54,7 +54,6 @@ import { usageFromPrompt } from "./stream/usage.js";
 import { RuntimeMetrics } from "./status.js";
 
 const PERMISSION_TIMEOUT_MS = 120_000;
-const TOOL_TIMEOUT_MS = 120_000;
 const TOOL_BATCH_MS = 100;
 
 type AntigravityModel = Model<"antigravity-acp">;
@@ -68,8 +67,8 @@ interface PendingPermission {
 
 interface PendingPiTool {
 	invocation: PiToolInvocation;
+	/** Answers the parked MCP call and releases its hold on the prompt watchdog. */
 	resolve: (result: CallToolResult) => void;
-	timer: ReturnType<typeof setTimeout>;
 }
 
 interface Binding {
@@ -438,7 +437,6 @@ export class AntigravityRuntime {
 				binding.pendingContextCount = context.messages.length;
 				binding.pendingContextFingerprint = messagesFingerprint(context.messages);
 				for (const { pending, message } of results) {
-					clearTimeout(pending.timer);
 					binding.pendingTools.delete(pending.invocation.id);
 					pending.resolve(toMcpToolResult(message as ToolResultMessage));
 				}
@@ -700,6 +698,8 @@ export class AntigravityRuntime {
 			this.resolvedBindings.add(createdBinding);
 			void connection.process.exited.then(() => {
 				this.resolvedBindings.delete(createdBinding);
+				// Parked calls have no wall-clock limit, so a dead process must answer them itself.
+				cancelPiTools(createdBinding, "Antigravity ACP process exited before Pi returned the tool result");
 				void bridge?.close();
 				const current = this.bindings.get(key);
 				if (current) void current.then((value) => value === createdBinding && this.bindings.delete(key));
@@ -745,13 +745,19 @@ export class AntigravityRuntime {
 				isError: true,
 			});
 		}
+		// No wall-clock limit: Pi tools (subagents, workflows, long shell commands) run as long as
+		// they need. The call stays parked until Pi returns its result, Pi continues without it,
+		// the turn is aborted, or the binding closes (cancelPiTools). While parked it holds the ACP
+		// prompt's progress watchdog, since Antigravity is legitimately silent meanwhile.
 		return new Promise<CallToolResult>((resolve) => {
-			const timer = setTimeout(() => {
-				if (!binding.pendingTools.delete(invocation.id)) return;
-				resolve({ content: [{ type: "text", text: "Pi tool call timed out" }], isError: true });
-			}, TOOL_TIMEOUT_MS);
-			timer.unref();
-			binding.pendingTools.set(invocation.id, { invocation, resolve, timer });
+			const release = binding.connection.holdPromptWatchdog(binding.session.sessionId);
+			binding.pendingTools.set(invocation.id, {
+				invocation,
+				resolve: (result) => {
+					release();
+					resolve(result);
+				},
+			});
 			binding.writer?.toolCall(invocation.id, invocation.name, args);
 			if (binding.toolBatchTimer) clearTimeout(binding.toolBatchTimer);
 			binding.toolBatchTimer = setTimeout(() => {
@@ -1035,7 +1041,6 @@ function cancelPiTools(binding: Binding, reason: string): void {
 	if (binding.toolBatchTimer) clearTimeout(binding.toolBatchTimer);
 	binding.toolBatchTimer = undefined;
 	for (const pending of binding.pendingTools.values()) {
-		clearTimeout(pending.timer);
 		pending.resolve({ content: [{ type: "text", text: reason }], isError: true });
 	}
 	binding.pendingTools.clear();
