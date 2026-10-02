@@ -36,7 +36,7 @@ import {
 	REQUIRED_BRIDGE_TOOLS,
 } from "./constants.js";
 export { MANAGED_AUTH_MARKER, PERMISSION_RESULT_KIND, PERMISSION_TOOL_NAME } from "./constants.js";
-import { mapSessionUpdate } from "./acp/events.js";
+import { mapSessionUpdate, type ToolActivityContext } from "./acp/events.js";
 import { ensureAntigravityAcpReady } from "./acp/setup.js";
 import { HeadlessOAuthRelay, shouldUseHeadlessOAuth } from "./acp/headless-oauth.js";
 import {
@@ -94,6 +94,8 @@ interface Binding {
 	bridge: PiMcpBridge | undefined;
 	toolFingerprint: string;
 	omittedTools: ToolOmission[];
+	/** Classifies ACP tool notifications as bridged Pi calls or native Antigravity tools. */
+	toolActivity: ToolActivityContext;
 	/** Instruction updates Pi added while a running ACP prompt was resumed; sent on the next prompt. */
 	deferredInstructions: string[];
 	turnCompletion: Promise<void> | undefined;
@@ -689,6 +691,7 @@ export class AntigravityRuntime {
 				bridge,
 				toolFingerprint: piToolFingerprint(tools),
 				omittedTools,
+				toolActivity: { bridgedToolNames: new Set(bridge?.mcpNames ?? []), bridgedCallIds: new Set() },
 				deferredInstructions: [],
 				turnCompletion: undefined,
 				abortRequested: false,
@@ -785,8 +788,7 @@ export class AntigravityRuntime {
 
 	private consumeUpdate(binding: Binding | undefined, notification: SessionNotification): void {
 		if (!binding || notification.sessionId !== binding.session.sessionId || !binding.writer) return;
-		const bridged = binding.bridge ? new Set(binding.bridge.mcpNames) : undefined;
-		for (const activity of mapSessionUpdate(notification, bridged)) {
+		for (const activity of mapSessionUpdate(notification, binding.toolActivity)) {
 			if (activity.type === "text") binding.writer.text(activity.delta);
 			else if (activity.type === "thought") binding.writer.thinking(activity.delta);
 			else if (activity.type === "tool" || activity.type === "plan") binding.writer.thinking(activity.text);

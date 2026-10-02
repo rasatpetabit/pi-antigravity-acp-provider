@@ -182,6 +182,20 @@ for await (const line of rl) {
 		const text = params.prompt.filter((block) => block.type === "text").map((block) => block.text).join("\n");
 		if (text.includes("bridge") && mcpServer) {
 			bridgePromptId = id;
+			if (text.includes("noisy")) {
+				// Tool status notifications as Antigravity sends them around a bridged MCP call and native tools.
+				const notes = [
+					{ sessionUpdate: "tool_call", toolCallId: "bridged-1", title: "Running pi_echo", status: "in_progress" },
+					{ sessionUpdate: "tool_call", toolCallId: "native-1", title: "grep pi_echo src", status: "in_progress", kind: "search" },
+					{ sessionUpdate: "tool_call_update", toolCallId: "native-1", status: "completed" },
+					{ sessionUpdate: "tool_call_update", toolCallId: "bridged-1", status: "failed", content: [{ type: "content", content: { type: "text", text: "BRIDGED_DETAIL" } }] },
+					{ sessionUpdate: "tool_call", toolCallId: "native-2", title: "false", status: "in_progress", kind: "execute" },
+					{ sessionUpdate: "tool_call_update", toolCallId: "native-2", status: "failed", content: [{ type: "content", content: { type: "text", text: "NATIVE_FAILURE" } }] },
+				];
+				for (const update of notes) {
+					send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: params.sessionId, update } });
+				}
+			}
 			const invocation = text.includes("parallel")
 				? Promise.all([
 						invokeMcpTool(mcpServer, "first"),

@@ -35,7 +35,7 @@ Against authenticated `agy_acp_server_1.1.1` on Linux:
 - A real prompt completed with `stopReason: "end_turn"` and streamed the requested exact response.
 - Both `session/set_model` and `session/set_config_option` were accepted by this server build.
 - Pi reasoning levels now map to exact ACP variants (`low`, `medium`, or `high`) through `session/set_model`; unsupported levels are hidden or safely clamped.
-- Antigravity session permissions support persisted `default`, `auto_edit`, and `yolo` modes through `session/set_mode`; per user request, fresh installations default to `yolo`.
+- Antigravity session permissions support persisted `default`, `auto_edit`, and `yolo` modes through `session/set_mode`; upstream defaulted fresh installations to `yolo`; this fork defaults to `default` and the setup wizard offers it first.
 
 ## Documentation status
 

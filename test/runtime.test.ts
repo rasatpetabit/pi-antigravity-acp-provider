@@ -298,6 +298,44 @@ describe("AntigravityRuntime", () => {
 		}
 	});
 
+	it("keeps Antigravity tool notifications for bridged calls out of the transcript", async () => {
+		const runtime = new AntigravityRuntime(
+			(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent] }),
+		);
+		try {
+			const tools = [
+				{ name: "echo", description: "Echo text", parameters: Type.Object({ text: Type.String() }) },
+			];
+			const writer = runtime.stream(
+				model,
+				normalizeContext({ messages: [{ role: "user", content: "use bridge noisy", timestamp: 1 }], tools }),
+				{ apiKey: "test-key" },
+			);
+			const events = [];
+			for await (const event of writer.stream) events.push(event);
+			const done = events.at(-1);
+			if (done?.type !== "done") throw new Error("missing bridged tool turn");
+			expect(done.reason).toBe("toolUse");
+			const thinking = done.message.content
+				.filter((block) => block.type === "thinking")
+				.map((block) => (block.type === "thinking" ? block.thinking : ""))
+				.join("");
+			// The native tool keeps one compact start line; its "completed" update is dropped.
+			expect(thinking).toContain("[Antigravity: grep pi_echo src]");
+			expect(thinking).toContain("[Antigravity tool failed: native-2]");
+			expect(thinking).toContain("NATIVE_FAILURE");
+			// Nothing for the bridged call, including its title-less failed update.
+			expect(thinking).not.toContain("Running pi_echo");
+			expect(thinking).not.toContain("BRIDGED_DETAIL");
+			expect(thinking).not.toContain("tool update");
+			expect(thinking).not.toContain("in_progress");
+			const call = done.message.content.find((block) => block.type === "toolCall");
+			expect(call).toMatchObject({ name: "echo" });
+		} finally {
+			await runtime.close();
+		}
+	});
+
 	it("round-trips an MCP call through a genuine Pi tool call", async () => {
 		const runtime = new AntigravityRuntime(
 			(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent] }),

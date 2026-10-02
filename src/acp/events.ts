@@ -15,9 +15,16 @@ export type AcpActivity =
  * gets exactly one compact line when it starts; progress updates surface only when they fail or
  * report a file edit.
  */
+export interface ToolActivityContext {
+	/** MCP-side names of the projected Pi tools (for example `pi_read`). */
+	bridgedToolNames: ReadonlySet<string>;
+	/** toolCallIds classified as bridged when their tool_call arrived; updated by this mapper. */
+	bridgedCallIds: Set<string>;
+}
+
 export function mapSessionUpdate(
 	notification: SessionNotification,
-	bridgedToolNames: ReadonlySet<string> = EMPTY_NAMES,
+	context: ToolActivityContext = { bridgedToolNames: EMPTY_NAMES, bridgedCallIds: new Set() },
 ): AcpActivity[] {
 	const update = notification.update;
 	switch (update.sessionUpdate) {
@@ -30,11 +37,18 @@ export function mapSessionUpdate(
 				? [{ type: "thought", delta: update.content.text }]
 				: [{ type: "unknown", updateType: `agent_thought:${update.content.type}` }];
 		case "tool_call": {
-			if (mentionsBridgedTool(update.title, bridgedToolNames)) return [];
+			if (isBridgedTitle(update.title, context.bridgedToolNames)) {
+				context.bridgedCallIds.add(update.toolCallId);
+				return [];
+			}
 			return [{ type: "tool", text: `\n[Antigravity: ${clean(update.title).slice(0, TITLE_LIMIT)}]\n` }];
 		}
 		case "tool_call_update": {
-			if (update.title && mentionsBridgedTool(update.title, bridgedToolNames)) return [];
+			// Identity comes from the tool_call that started this call, not from an optional title.
+			if (context.bridgedCallIds.has(update.toolCallId)) {
+				if (update.status === "completed" || update.status === "failed") context.bridgedCallIds.delete(update.toolCallId);
+				return [];
+			}
 			const label = clean(update.title ?? update.toolCallId).slice(0, TITLE_LIMIT);
 			if (update.status === "failed") {
 				const details = toolContentText(update.content);
@@ -75,10 +89,15 @@ function toolContentText(content: SessionNotification["update"] extends infer _T
 const EMPTY_NAMES: ReadonlySet<string> = new Set();
 const TITLE_LIMIT = 200;
 
-/** True when the title names a tool the Pi MCP bridge projected (for example "Running pi_read"). */
-function mentionsBridgedTool(title: string, bridgedToolNames: ReadonlySet<string>): boolean {
+/**
+ * True only when the whole title names a projected Pi tool, as Antigravity titles MCP calls
+ * ("Running pi_read", or the bare name). A native command that merely mentions a tool name,
+ * such as "grep pi_read src", is not a bridged call.
+ */
+function isBridgedTitle(title: string, bridgedToolNames: ReadonlySet<string>): boolean {
 	if (bridgedToolNames.size === 0) return false;
-	return title.split(/[^A-Za-z0-9_-]+/u).some((token) => bridgedToolNames.has(token));
+	const match = /^(?:Running\s+)?([A-Za-z0-9_-]+)$/u.exec(title.trim());
+	return match !== null && bridgedToolNames.has(match[1]!);
 }
 
 function editedPaths(content: unknown): string[] {
