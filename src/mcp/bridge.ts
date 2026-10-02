@@ -43,8 +43,14 @@ export interface PiMcpBridgeOptions {
 	onCall: (invocation: PiToolInvocation) => Promise<CallToolResult>;
 }
 
+/**
+ * Reuse identity for a bridge: the projected tools and every omission. An active tool that
+ * cannot be projected changes the identity even when the projected set is unchanged.
+ */
 export function piToolFingerprint(tools: readonly Tool[]): string {
-	return fingerprintOf(projectTools(tools, []));
+	const omissions: ToolOmission[] = [];
+	const projected = projectTools(tools, omissions);
+	return JSON.stringify([fingerprintOf(projected), omissions]);
 }
 
 /** The projection Antigravity would receive for these Pi tools, with every omission named. */

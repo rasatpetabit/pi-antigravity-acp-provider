@@ -1,4 +1,10 @@
-import { type AgentMessage, type AgentTool, runAgentLoop } from "@earendil-works/pi-agent-core";
+import {
+	type AgentEvent,
+	type AgentLoopConfig,
+	type AgentMessage,
+	type AgentTool,
+	runAgentLoop,
+} from "@earendil-works/pi-agent-core";
 import {
 	createInitialSystemMessage,
 	getCurrentTools,
@@ -58,6 +64,7 @@ interface LogEntry {
 	pid: number;
 	method: string;
 	modeId?: string;
+	mode?: string;
 	mcpTools?: string[];
 	prompt?: Array<{ type: string; text?: string; resource?: { text?: string } }>;
 }
@@ -104,18 +111,28 @@ function agentTool(name: string, description = `${name} tool`): AgentTool {
 	};
 }
 
-/** Drive one Pi turn through the host agent loop, which runs the real declareToolChanges. */
-async function piTurn(
+type TurnState = { messages: AgentMessage[]; requests: TranscriptContext[] };
+type TurnHooks = Pick<AgentLoopConfig, "beforeToolCall" | "afterToolCall"> & {
+	onEvent?: (event: AgentEvent) => void;
+};
+
+/**
+ * Drive one Pi turn through the host agent loop, which runs the real declareToolChanges and,
+ * for a bridged call, the real tool validation, hooks and execution. Returns the messages added.
+ */
+async function piTurnMessages(
 	runtime: AntigravityRuntime,
-	state: { messages: AgentMessage[]; requests: TranscriptContext[] },
+	state: TurnState,
 	tools: AgentTool[],
 	prompts: Message[],
-): Promise<void> {
+	hooks: TurnHooks = {},
+): Promise<AgentMessage[]> {
+	const { onEvent, ...toolHooks } = hooks;
 	const added = await runAgentLoop(
 		prompts,
 		{ messages: state.messages, tools },
-		{ model, convertToLlm: (messages) => messages as Message[] },
-		async () => undefined,
+		{ model, convertToLlm: (messages) => messages as Message[], ...toolHooks },
+		async (event) => onEvent?.(event),
 		undefined,
 		(streamModel, context, options) => {
 			state.requests.push(context);
@@ -127,10 +144,27 @@ async function piTurn(
 		},
 	);
 	state.messages.push(...added);
+	return added;
+}
+
+async function piTurn(
+	runtime: AntigravityRuntime,
+	state: TurnState,
+	tools: AgentTool[],
+	prompts: Message[],
+	hooks: TurnHooks = {},
+): Promise<AgentMessage[]> {
+	const added = await piTurnMessages(runtime, state, tools, prompts, hooks);
 	const last = added.at(-1);
 	if (last?.role !== "assistant" || last.stopReason !== "stop") {
 		throw new Error(`turn did not complete: ${JSON.stringify(last && "errorMessage" in last ? last.errorMessage : last)}`);
 	}
+	return added;
+}
+
+function lastError(added: AgentMessage[]): string | undefined {
+	const last = added.at(-1);
+	return last?.role === "assistant" && last.stopReason === "error" ? last.errorMessage : undefined;
 }
 
 function initialState(tools: AgentTool[]): { messages: AgentMessage[]; requests: TranscriptContext[] } {
@@ -141,7 +175,7 @@ function initialState(tools: AgentTool[]): { messages: AgentMessage[]; requests:
 const user = (content: string): Message => ({ role: "user", content, timestamp: Date.now() });
 
 describe("Pi host resolution", () => {
-	it("resolves @earendil-works/pi-ai to the Pi 0.99.2 host, not the 0.85 devDependency", async () => {
+	it("resolves @earendil-works/pi-ai to the installed Pi 0.99.2 host modules", async () => {
 		const hostPackage = path.join(PI_HOST, "node_modules", "@earendil-works", "pi-ai", "package.json");
 		const hostVersion = (JSON.parse(fs.readFileSync(hostPackage, "utf8")) as { version: string }).version;
 		const hostCompat = (await import(
@@ -269,6 +303,89 @@ describe("system prompt and tools on the Pi 0.99 transcript", () => {
 	});
 });
 
+describe("bridged tool calls through the Pi host loop", () => {
+	it("executes a bridged call through runAgentLoop's real hooks and returns the result to ACP", async () => {
+		const { runtime, entries } = fakeRuntime();
+		const executed: unknown[] = [];
+		const before: Array<{ id: string; name: string; args: unknown }> = [];
+		const after: string[] = [];
+		const events: string[] = [];
+		const echo: AgentTool = {
+			...agentTool("echo"),
+			execute: async (_id, params) => {
+				executed.push(params);
+				return { content: [{ type: "text", text: `host-executed:${(params as { text: string }).text}` }], details: undefined };
+			},
+		};
+		const state = initialState([echo]);
+		let added: AgentMessage[];
+		try {
+			added = await piTurn(runtime, state, [echo], [user("use bridge")], {
+				beforeToolCall: async ({ toolCall, args }) => {
+					before.push({ id: toolCall.id, name: toolCall.name, args });
+					return undefined;
+				},
+				afterToolCall: async ({ toolCall }) => {
+					after.push(toolCall.id);
+					return undefined;
+				},
+				onEvent: (event) => {
+					if (event.type.startsWith("tool_execution")) events.push(event.type);
+				},
+			});
+		} finally {
+			await runtime.close();
+		}
+		// The host loop validated, hooked and executed the call exactly once.
+		expect(before).toHaveLength(1);
+		expect(before[0]).toMatchObject({ name: "echo", args: { text: "from gemini" } });
+		expect(after).toEqual([before[0]!.id]);
+		expect(executed).toEqual([{ text: "from gemini" }]);
+		expect(events).toEqual(["tool_execution_start", "tool_execution_end"]);
+		// Pi transcript: the prompt, a genuine tool call, Pi's own tool result, then the completed answer.
+		expect(added.map((message) => (message.role === "assistant" ? `assistant:${message.stopReason}` : message.role))).toEqual([
+			"user",
+			"assistant:toolUse",
+			"toolResult",
+			"assistant:stop",
+		]);
+		const final = added.at(-1);
+		if (final?.role !== "assistant") throw new Error("missing final answer");
+		// The fake ACP agent echoes the MCP result it received back as its final text.
+		expect(final.content).toEqual([{ type: "text", text: "host-executed:from gemini" }]);
+		// One ACP session and one ACP prompt: the tool result resumed the running prompt.
+		expect(entries().filter((entry) => entry.method === "session/new")).toHaveLength(1);
+		expect(entries().filter((entry) => entry.method === "session/prompt")).toHaveLength(1);
+		// Two provider requests: the call, then the continuation carrying Pi's tool result.
+		expect(state.requests).toHaveLength(2);
+	});
+
+	it("does not execute a bridged call that the before-tool hook blocks, and ACP receives the block", async () => {
+		const { runtime } = fakeRuntime();
+		const executed: unknown[] = [];
+		const echo: AgentTool = {
+			...agentTool("echo"),
+			execute: async (_id, params) => {
+				executed.push(params);
+				return { content: [{ type: "text", text: "should not run" }], details: undefined };
+			},
+		};
+		const state = initialState([echo]);
+		let added: AgentMessage[];
+		try {
+			added = await piTurn(runtime, state, [echo], [user("use bridge")], {
+				beforeToolCall: async () => ({ block: true, reason: "BLOCKED-BY-HOOK" }),
+			});
+		} finally {
+			await runtime.close();
+		}
+		expect(executed).toEqual([]);
+		const final = added.at(-1);
+		if (final?.role !== "assistant") throw new Error("missing final answer");
+		expect(JSON.stringify(final.content)).toContain("BLOCKED-BY-HOOK");
+	});
+});
+
 describe("usage", () => {
 	it("always reports knownCost", async () => {
 		expect(usageFromPrompt({ stopReason: "end_turn" }).cost.knownCost).toBe(0);
@@ -352,6 +469,62 @@ describe("permission mode negotiation", () => {
 	});
 });
 
+describe("permission mode changes on live sessions", () => {
+	async function turn(runtime: AntigravityRuntime, messages: Message[]) {
+		const writer = runtime.stream(model, normalizeContext({ messages }), { sessionId: "live-mode", apiKey: "test-key" });
+		for await (const _event of writer.stream) void _event;
+		return writer.message;
+	}
+
+	it("applies a supported mode to the live session without respawning", async () => {
+		const { runtime, entries } = fakeRuntime();
+		try {
+			const first = await turn(runtime, [user("one")]);
+			await runtime.setPermissionMode("auto_edit");
+			expect((await runtime.snapshot()).processes[0]?.permissionMode).toBe("auto_edit");
+			const second = await turn(runtime, [user("one"), first, user("two")]);
+			expect(second.stopReason).toBe("stop");
+		} finally {
+			await runtime.close();
+		}
+		const log = entries();
+		expect(log.filter((entry) => entry.method === "session/new")).toHaveLength(1);
+		expect(log.filter((entry) => entry.method === "session/prompt").map((entry) => entry.mode)).toEqual([
+			"default",
+			"auto_edit",
+		]);
+	});
+
+	for (const scenario of ["no-auto-edit-mode", "set-mode-fails"] as const) {
+		it(`closes a live session that cannot apply the new mode (${scenario}); no prompt runs in the old mode`, async () => {
+			const { runtime, entries } = fakeRuntime(scenario);
+			let second;
+			try {
+				const first = await turn(runtime, [user("one")]);
+				expect(first.stopReason).toBe("stop");
+				await runtime.setPermissionMode("auto_edit");
+				const snapshot = await runtime.snapshot();
+				// No live binding remains in a mode other than the one the caller will persist.
+				expect(snapshot.permissionMode).toBe("auto_edit");
+				expect(snapshot.processes.filter((process) => process.permissionMode !== "auto_edit")).toEqual([]);
+				second = await turn(runtime, [user("one"), first, user("two")]);
+			} finally {
+				await runtime.close();
+			}
+			// The next turn re-negotiates through the create path, which refuses the session.
+			expect(second.stopReason).toBe("error");
+			expect(second.errorMessage).toMatch(
+				scenario === "no-auto-edit-mode" ? /did not advertise permission mode 'auto_edit'/u : /set_mode failed/u,
+			);
+			const log = entries();
+			expect(log.filter((entry) => entry.method === "session/new")).toHaveLength(2);
+			expect(log.filter((entry) => entry.method === "session/prompt").map((entry) => entry.mode)).toEqual([
+				"default",
+			]);
+		});
+	}
+});
+
 describe("required Pi tool projection", () => {
 	const objectTool = (name: string): Tool => ({
 		name,
@@ -428,6 +601,66 @@ describe("required Pi tool projection", () => {
 		} finally {
 			await runtime.close();
 		}
+	});
+});
+
+describe("required Pi tool projection on a warm session", () => {
+	const badSchemaTool = (name: string): AgentTool => ({
+		...agentTool(name),
+		parameters: Type.String() as unknown as AgentTool["parameters"],
+	});
+
+	it("refuses before the next prompt when an unprojectable required tool becomes active", async () => {
+		const { runtime, entries } = fakeRuntime();
+		const echo = agentTool("echo");
+		const state = initialState([echo]);
+		let added: AgentMessage[];
+		try {
+			await piTurn(runtime, state, [echo], [user("turn one")]);
+			const loadout = [echo, badSchemaTool("ask_user_question")];
+			// The projected set is unchanged; only the omission differs.
+			expect(planToolProjection(loadout).projected).toEqual(["echo"]);
+			added = await piTurnMessages(runtime, state, loadout, [user("turn two")]);
+		} finally {
+			await runtime.close();
+		}
+		expect(lastError(added)).toMatch(/Required Pi tools cannot be bridged[\s\S]*ask_user_question \(schema/u);
+		expect(entries().filter((entry) => entry.method === "session/prompt")).toHaveLength(1);
+		expect(entries().filter((entry) => entry.method === "session/new")).toHaveLength(1);
+	});
+
+	it("refuses before the next prompt when a required tool is added past the 64-tool cap", async () => {
+		const { runtime, entries } = fakeRuntime();
+		const fillers = Array.from({ length: 64 }, (_, index) => agentTool(`filler_${index}`));
+		const state = initialState(fillers);
+		let added: AgentMessage[];
+		try {
+			await piTurn(runtime, state, fillers, [user("turn one")]);
+			const loadout = [...fillers, agentTool("advisor")];
+			expect(planToolProjection(loadout).omissions).toEqual([{ name: "advisor", reason: "tool limit 64 reached" }]);
+			added = await piTurnMessages(runtime, state, loadout, [user("turn two")]);
+		} finally {
+			await runtime.close();
+		}
+		expect(lastError(added)).toMatch(/Required Pi tools cannot be bridged[\s\S]*advisor \(tool limit 64 reached\)/u);
+		expect(entries().filter((entry) => entry.method === "session/prompt")).toHaveLength(1);
+		expect(entries().filter((entry) => entry.method === "session/new")).toHaveLength(1);
+	});
+
+	it("respawns, rather than reusing, when only a non-required omission changes", async () => {
+		const { runtime, entries } = fakeRuntime();
+		const echo = agentTool("echo");
+		const state = initialState([echo]);
+		try {
+			await piTurn(runtime, state, [echo], [user("turn one")]);
+			await piTurn(runtime, state, [echo, badSchemaTool("odd")], [user("turn two")]);
+			expect((await runtime.snapshot()).processes[0]?.omittedTools).toEqual([
+				{ name: "odd", reason: "schema must be a supported, bounded object" },
+			]);
+		} finally {
+			await runtime.close();
+		}
+		expect(entries().filter((entry) => entry.method === "session/new")).toHaveLength(2);
 	});
 });
 

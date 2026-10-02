@@ -78,6 +78,8 @@ interface Binding {
 	connection: AntigravityAcpConnection;
 	initialize: InitializeResponse;
 	session: NewSessionResponse;
+	/** The permission mode this ACP session was confirmed to be in. */
+	mode: PermissionMode;
 	modelId: string;
 	messageCount: number;
 	historyFingerprint: string;
@@ -127,6 +129,7 @@ export interface RuntimeSnapshot {
 		pid?: number;
 		generation: number;
 		sessionId: string;
+		permissionMode: PermissionMode;
 		modelId: string;
 		alive: boolean;
 		waitingForPermission: boolean;
@@ -282,14 +285,30 @@ export class AntigravityRuntime {
 		clearAntigravityCredentials();
 	}
 
+	/**
+	 * Fail closed: every live session either confirms the new mode via session/set_mode or is
+	 * closed, so its next turn re-negotiates through the create/restore path. When this resolves,
+	 * no live binding is in any other mode, and the caller may persist the mode.
+	 */
 	async setPermissionMode(mode: PermissionMode): Promise<void> {
+		// New and in-flight bindings negotiate the new mode; runQueued drops any binding whose
+		// confirmed mode differs before prompting.
+		this.permissionMode = mode;
 		await Promise.all(
 			[...this.resolvedBindings].map(async (binding) => {
-				if (!supportsMode(binding.session, mode)) return;
-				await binding.connection.setMode(binding.session.sessionId, mode);
+				if (binding.mode === mode) return;
+				if (supportsMode(binding.session, mode)) {
+					try {
+						await binding.connection.setMode(binding.session.sessionId, mode);
+						binding.mode = mode;
+						return;
+					} catch {
+						// Fall through: a session that could not confirm the mode is closed.
+					}
+				}
+				await this.dropBinding(binding.key, binding);
 			}),
 		);
-		this.permissionMode = mode;
 	}
 
 	getPermission(requestId: string): PermissionView | undefined {
@@ -310,6 +329,7 @@ export class AntigravityRuntime {
 					...(pid === undefined ? {} : { pid }),
 					generation: binding.connection.process.generation,
 					sessionId: binding.session.sessionId,
+					permissionMode: binding.mode,
 					modelId: binding.modelId,
 					alive: binding.connection.process.alive,
 					waitingForPermission: binding.permission !== undefined,
@@ -427,7 +447,10 @@ export class AntigravityRuntime {
 			}
 		}
 
-		if (binding.toolFingerprint !== piToolFingerprint(tools)) {
+		// Validate the full projection plan on every turn, before any reuse decision: a required
+		// tool that became active but cannot be projected refuses before the next ACP prompt.
+		assertRequiredToolsProjected(toolOmissions(binding.initialize, tools));
+		if (binding.toolFingerprint !== piToolFingerprint(tools) || binding.mode !== this.permissionMode) {
 			await this.dropBinding(key, binding);
 			binding = await this.getBinding(key, model, acpModelId, options.apiKey, writer, tools, options.signal);
 		}
@@ -595,11 +618,7 @@ export class AntigravityRuntime {
 			const initialize = await connection.initialize();
 			await authenticateForCredential(connection, initialize, apiKey, signal);
 			const mcpHttp = initialize.agentCapabilities?.mcpCapabilities?.http === true;
-			const omittedTools = mcpHttp
-				? planToolProjection(tools).omissions
-				: tools
-						.filter((tool) => tool.name !== PERMISSION_TOOL_NAME)
-						.map((tool) => ({ name: tool.name, reason: "Antigravity did not advertise MCP over HTTP" }));
+			const omittedTools = toolOmissions(initialize, tools);
 			assertRequiredToolsProjected(omittedTools);
 			let mcpServer;
 			if (tools.length > 0 && mcpHttp) {
@@ -636,15 +655,16 @@ export class AntigravityRuntime {
 			}
 			session ??= await connection.newSession(cwd, signal, mcpServers);
 			// Fail closed on new and restored sessions alike: never prompt in an unconfirmed mode.
-			if (!supportsMode(session, this.permissionMode)) {
+			const mode = this.permissionMode;
+			if (!supportsMode(session, mode)) {
 				if (restored && piSessionId) this.sessionStore?.remove(piSessionId);
 				throw new AntigravityAcpError(
 					"protocol",
-					`Antigravity ${restored ? "restored" : "new"} session did not advertise permission mode '${this.permissionMode}'; refusing the session`,
+					`Antigravity ${restored ? "restored" : "new"} session did not advertise permission mode '${mode}'; refusing the session`,
 				);
 			}
-			if (session.modes?.currentModeId !== this.permissionMode) {
-				await connection.setMode(session.sessionId, this.permissionMode, signal);
+			if (session.modes?.currentModeId !== mode) {
+				await connection.setMode(session.sessionId, mode, signal);
 			}
 			const currentModel = session.models?.currentModelId;
 			if (currentModel !== acpModelId) await connection.setModel(session.sessionId, acpModelId, signal);
@@ -654,6 +674,7 @@ export class AntigravityRuntime {
 				connection,
 				initialize,
 				session,
+				mode,
 				modelId: acpModelId,
 				messageCount: restored && saved ? saved.messageCount : 0,
 				historyFingerprint: restored && saved ? saved.historyFingerprint : messagesFingerprint([]),
@@ -916,6 +937,14 @@ function messageFingerprint(message: Message): string {
 function deferInstructionUpdates(binding: Binding, context: TranscriptContext): void {
 	const start = Math.min(binding.pendingContextCount, context.messages.length);
 	binding.deferredInstructions.push(...renderInstructionUpdates(context.messages.slice(start)));
+}
+
+/** Every active Pi tool Antigravity will not receive for this agent, with the reason. */
+function toolOmissions(initialize: InitializeResponse, tools: readonly Tool[]): ToolOmission[] {
+	if (initialize.agentCapabilities?.mcpCapabilities?.http === true) return planToolProjection(tools).omissions;
+	return tools
+		.filter((tool) => tool.name !== PERMISSION_TOOL_NAME)
+		.map((tool) => ({ name: tool.name, reason: "Antigravity did not advertise MCP over HTTP" }));
 }
 
 function assertRequiredToolsProjected(omissions: readonly ToolOmission[]): void {

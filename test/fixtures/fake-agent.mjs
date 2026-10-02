@@ -20,13 +20,13 @@ const log = (entry) => {
 	if (logFile) fs.appendFileSync(logFile, `${JSON.stringify({ pid: process.pid, ...entry })}\n`);
 };
 const advertisedModes = (restoring) =>
-	(scenario === "no-default-mode" || (restoring && scenario === "no-default-mode-on-restore")
+	scenario === "no-default-mode" || (restoring && scenario === "no-default-mode-on-restore")
 		? [{ id: "yolo", name: "YOLO" }]
 		: [
 				{ id: "default", name: "Default" },
-				{ id: "auto_edit", name: "Auto Edit" },
+				...(scenario === "no-auto-edit-mode" ? [] : [{ id: "auto_edit", name: "Auto Edit" }]),
 				{ id: "yolo", name: "YOLO" },
-			]);
+			];
 
 for await (const line of rl) {
 	if (!line.trim()) continue;
@@ -46,7 +46,10 @@ for await (const line of rl) {
 	if (method && logFile) {
 		const entry = { method };
 		if (method === "session/set_mode") entry.modeId = params.modeId;
-		if (method === "session/prompt") entry.prompt = params.prompt;
+		if (method === "session/prompt") {
+			entry.prompt = params.prompt;
+			entry.mode = mode;
+		}
 		if (method === "session/new" || method === "session/resume" || method === "session/load") {
 			const server = params.mcpServers?.find((candidate) => candidate.type === "http");
 			entry.mcpTools = server ? await listMcpTools(server) : [];
@@ -169,6 +172,10 @@ for await (const line of rl) {
 		model = params.modelId;
 		send({ jsonrpc: "2.0", id, result: {} });
 	} else if (method === "session/set_mode") {
+		if (scenario === "set-mode-fails" && params.modeId !== "default") {
+			send({ jsonrpc: "2.0", id, error: { code: -32603, message: "set_mode failed" } });
+			continue;
+		}
 		mode = params.modeId;
 		send({ jsonrpc: "2.0", id, result: {} });
 	} else if (method === "session/prompt") {
