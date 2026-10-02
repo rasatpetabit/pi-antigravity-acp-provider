@@ -533,6 +533,9 @@ export class AntigravityRuntime {
 		} finally {
 			completeTurn?.();
 			binding.turnCompletion = undefined;
+			// The ACP prompt has ended (finished, failed or cancelled), so none of its tool calls can
+			// still receive updates; forget them so a persistent binding cannot accumulate ids.
+			binding.toolActivity.bridgedCallIds.clear();
 			binding.abortRequested = false;
 			binding.writer = undefined;
 			release();

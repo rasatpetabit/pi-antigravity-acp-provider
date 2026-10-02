@@ -220,6 +220,17 @@ for await (const line of rl) {
 		}
 		if (text.includes("hang")) {
 			hangingPromptId = id;
+			if (text.includes("orphan")) {
+				// A bridged call that starts and never reaches a terminal update before the turn is cancelled.
+				send({
+					jsonrpc: "2.0",
+					method: "session/update",
+					params: {
+						sessionId: params.sessionId,
+						update: { sessionUpdate: "tool_call", toolCallId: "orphan-1", title: "Running pi_echo", status: "in_progress" },
+					},
+				});
+			}
 			continue;
 		}
 		if (text.includes("permission")) {

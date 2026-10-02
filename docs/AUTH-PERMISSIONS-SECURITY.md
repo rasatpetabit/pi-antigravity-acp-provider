@@ -1,6 +1,6 @@
 # Authentication, permissions, and security
 
-> **Historical design:** this document describes the superseded Gemini CLI/default-deny architecture. The current Antigravity implementation defaults to `yolo` at the user's request, meaning native commands and edits may run without confirmation. Use `/antigravity-acp permissions default` for the safer prompting posture. See [ANTIGRAVITY-MIGRATION.md](ANTIGRAVITY-MIGRATION.md).
+> **Historical design:** this document describes the superseded Gemini CLI/default-deny architecture. This fork of the Antigravity implementation defaults to `default` (ask before sensitive operations), and missing or invalid configuration also means `default`. `/antigravity-acp permissions yolo` lets native commands and edits run without confirmation. See [ANTIGRAVITY-MIGRATION.md](ANTIGRAVITY-MIGRATION.md).
 
 ## 1. Security posture
 

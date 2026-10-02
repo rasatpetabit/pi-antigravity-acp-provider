@@ -485,6 +485,41 @@ describe("AntigravityRuntime", () => {
 		}
 	});
 
+	it("forgets bridged tool-call ids when a turn on a warm binding is cancelled", async () => {
+		const runtime = new AntigravityRuntime(
+			(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent] }),
+		);
+		try {
+			const tools = [
+				{ name: "echo", description: "Echo text", parameters: Type.Object({ text: Type.String() }) },
+			];
+			const controller = new AbortController();
+			const writer = runtime.stream(
+				model,
+				normalizeContext({ messages: [{ role: "user", content: "hang orphan", timestamp: 1 }], tools }),
+				{ sessionId: "orphan-session", apiKey: "test-key", signal: controller.signal },
+			);
+			const internals = runtime as unknown as { resolvedBindings: Set<{ toolActivity: { bridgedCallIds: Set<string> } }> };
+			const binding = await (async () => {
+				for (let attempt = 0; attempt < 200; attempt++) {
+					const [first] = internals.resolvedBindings;
+					if (first?.toolActivity.bridgedCallIds.has("orphan-1")) return first;
+					await new Promise((resolve) => setTimeout(resolve, 10));
+				}
+				throw new Error("bridged call was never classified");
+			})();
+			controller.abort();
+			const events = [];
+			for await (const event of writer.stream) events.push(event);
+			expect(events.at(-1)).toMatchObject({ type: "error", reason: "aborted" });
+			const snapshot = await runtime.snapshot();
+			expect(snapshot.bindings).toBe(1);
+			expect(binding.toolActivity.bridgedCallIds.size).toBe(0);
+		} finally {
+			await runtime.close();
+		}
+	});
+
 	it("cancels an ACP prompt while preserving a healthy warm binding", async () => {
 		const runtime = new AntigravityRuntime(
 			(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent] }),
