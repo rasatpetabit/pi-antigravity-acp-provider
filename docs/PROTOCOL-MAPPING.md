@@ -132,9 +132,7 @@ interface ToolActivity {
 
 Default v1 rendering:
 
-- `tool_call`: close text, append a concise thinking line (`[Gemini tool: title — status]`).
-- `tool_call_update`: append only changed status/output; render diff content with bounded unified-diff formatting; do not dump raw input/output by default.
-- completion/failure: update the line/block; preserve structured activity in message diagnostics if Pi's diagnostic type allows bounded JSON.
+- `tool_call` and `tool_call_update`: not rendered. Bridged `pi_*` calls appear as genuine Pi tool cards; native Antigravity tool status is dropped as transcript noise.
 
 Never emit a Pi executable `toolCall` for a Gemini tool that Gemini has already or will execute. The exception is provider-owned permission/MCP round trips, where Pi is intentionally the executor/decision maker.
 

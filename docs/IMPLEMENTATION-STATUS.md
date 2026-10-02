@@ -14,7 +14,7 @@ The bundled Gemini CLI implementation was superseded after its individual Code A
 - Antigravity Google/API-key `/login`, automatic SSH/headless OAuth URL capture and validated loopback-callback relay, structural local auth health, network validation through setup/qualification, local logout, and account-switch reset flow.
 - Antigravity fallback models, authenticated ACP model discovery, catalog refresh, and `session/set_model` switching.
 - Pi-to-ACP text/image/context conversion with bounded fresh-session reconstruction.
-- ACP text, thought, plan, and native-tool activity mapping to balanced Pi events. Status for bridged `pi_*` calls is suppressed (Pi renders the real tool card); a native tool shows one line when it starts and again only if it fails or edits a file.
+- ACP text, thought, and plan mapping to balanced Pi events. Antigravity tool notifications (`tool_call`, `tool_call_update`) are not rendered: bridged `pi_*` calls appear as Pi tool cards, and native-tool status lines are dropped.
 - ACP usage/quota metadata mapping to Pi usage and `/antigravity-acp quota` process metrics.
 - Persistent ACP bindings keyed by Pi session ID, serialized turns, on-disk restoration through `session/resume`/`session/load`, reconstruction fallback, rewind detection, and cleanup.
 - Persisted Antigravity permission modes (`default`, `auto_edit`, and `yolo`). This fork fails closed: missing or invalid configuration means `default`, and the setup wizard offers `default` first. Prompting modes retain single-use, fail-closed ACP permission continuation through a real Pi tool round trip.

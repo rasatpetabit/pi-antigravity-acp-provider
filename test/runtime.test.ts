@@ -298,7 +298,7 @@ describe("AntigravityRuntime", () => {
 		}
 	});
 
-	it("keeps Antigravity tool notifications for bridged calls out of the transcript", async () => {
+	it("keeps Antigravity tool notifications out of the transcript", async () => {
 		const runtime = new AntigravityRuntime(
 			(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent] }),
 		);
@@ -320,15 +320,11 @@ describe("AntigravityRuntime", () => {
 				.filter((block) => block.type === "thinking")
 				.map((block) => (block.type === "thinking" ? block.thinking : ""))
 				.join("");
-			// The native tool keeps one compact start line; its "completed" update is dropped.
-			expect(thinking).toContain("[Antigravity: grep pi_echo src]");
-			expect(thinking).toContain("[Antigravity tool failed: native-2]");
-			expect(thinking).toContain("NATIVE_FAILURE");
-			// Nothing for the bridged call, including its title-less failed update.
-			expect(thinking).not.toContain("Running pi_echo");
-			expect(thinking).not.toContain("BRIDGED_DETAIL");
-			expect(thinking).not.toContain("tool update");
-			expect(thinking).not.toContain("in_progress");
+			// No Antigravity tool notification reaches the transcript, bridged or native, success or failure.
+			expect(thinking).not.toContain("Antigravity");
+			for (const marker of ["pi_echo", "grep", "BRIDGED_DETAIL", "NATIVE_FAILURE", "in_progress", "completed"]) {
+				expect(thinking).not.toContain(marker);
+			}
 			const call = done.message.content.find((block) => block.type === "toolCall");
 			expect(call).toMatchObject({ name: "echo" });
 		} finally {
@@ -480,41 +476,6 @@ describe("AntigravityRuntime", () => {
 			for await (const event of second.stream) secondEvents.push(event);
 			expect(secondEvents.at(-1)).toMatchObject({ type: "error", reason: "aborted" });
 			expect((await runtime.snapshot()).processes[0]?.alive).toBe(true);
-		} finally {
-			await runtime.close();
-		}
-	});
-
-	it("forgets bridged tool-call ids when a turn on a warm binding is cancelled", async () => {
-		const runtime = new AntigravityRuntime(
-			(options) => new AntigravityAcpConnection({ ...options, command: process.execPath, args: [fakeAgent] }),
-		);
-		try {
-			const tools = [
-				{ name: "echo", description: "Echo text", parameters: Type.Object({ text: Type.String() }) },
-			];
-			const controller = new AbortController();
-			const writer = runtime.stream(
-				model,
-				normalizeContext({ messages: [{ role: "user", content: "hang orphan", timestamp: 1 }], tools }),
-				{ sessionId: "orphan-session", apiKey: "test-key", signal: controller.signal },
-			);
-			const internals = runtime as unknown as { resolvedBindings: Set<{ toolActivity: { bridgedCallIds: Set<string> } }> };
-			const binding = await (async () => {
-				for (let attempt = 0; attempt < 200; attempt++) {
-					const [first] = internals.resolvedBindings;
-					if (first?.toolActivity.bridgedCallIds.has("orphan-1")) return first;
-					await new Promise((resolve) => setTimeout(resolve, 10));
-				}
-				throw new Error("bridged call was never classified");
-			})();
-			controller.abort();
-			const events = [];
-			for await (const event of writer.stream) events.push(event);
-			expect(events.at(-1)).toMatchObject({ type: "error", reason: "aborted" });
-			const snapshot = await runtime.snapshot();
-			expect(snapshot.bindings).toBe(1);
-			expect(binding.toolActivity.bridgedCallIds.size).toBe(0);
 		} finally {
 			await runtime.close();
 		}
