@@ -461,6 +461,8 @@ export class AntigravityRuntime {
 		await previous;
 
 		let completeTurn: (() => void) | undefined;
+		// Bound once the prompt binding is final; removed in finally.
+		let onTurnAbort: (() => void) | undefined;
 		try {
 			if (
 				context.messages.length < binding.messageCount ||
@@ -498,10 +500,18 @@ export class AntigravityRuntime {
 			binding.turnCompletion = new Promise<void>((resolve) => {
 				completeTurn = resolve;
 			});
+			if (options.signal) {
+				const promptBinding = binding;
+				onTurnAbort = () => abortTurn(promptBinding);
+				if (options.signal.aborted) onTurnAbort();
+				else options.signal.addEventListener("abort", onTurnAbort, { once: true });
+			}
 			const response = await binding.connection.prompt(
 				{ sessionId: binding.session.sessionId, prompt: parts.prompt },
 				options.signal,
 			);
+			// A completed prompt wins over a later abort, as before.
+			if (onTurnAbort) options.signal?.removeEventListener("abort", onTurnAbort);
 			const activeWriter = binding.writer ?? writer;
 			if (binding.abortRequested) throw abortError();
 			const usage = usageFromPrompt(response);
@@ -524,9 +534,12 @@ export class AntigravityRuntime {
 			}
 		} catch (error) {
 			binding.writer?.fail(error, isAbort(error));
+			// An acknowledged abort keeps a healthy process, so nothing else answers what is parked.
+			if (isAbort(error) || binding.abortRequested) abortTurn(binding);
 			if (!binding.connection.process.alive) await this.dropBinding(key, binding);
 			throw error;
 		} finally {
+			if (onTurnAbort) options.signal?.removeEventListener("abort", onTurnAbort);
 			completeTurn?.();
 			binding.turnCompletion = undefined;
 			binding.abortRequested = false;
@@ -545,7 +558,7 @@ export class AntigravityRuntime {
 		let killTimer: ReturnType<typeof setTimeout> | undefined;
 		const abort = () => {
 			if (binding.abortRequested) return;
-			binding.abortRequested = true;
+			abortTurn(binding);
 			void binding.connection.cancel(binding.session.sessionId).catch(() => undefined);
 			killTimer = setTimeout(() => void binding.connection.close(), 1_500);
 		};
@@ -700,10 +713,14 @@ export class AntigravityRuntime {
 				this.resolvedBindings.delete(createdBinding);
 				// Parked calls have no wall-clock limit, so a dead process must answer them itself.
 				cancelPiTools(createdBinding, "Antigravity ACP process exited before Pi returned the tool result");
-				void bridge?.close();
+				void bridge?.close().catch(() => undefined);
 				const current = this.bindings.get(key);
-				if (current) void current.then((value) => value === createdBinding && this.bindings.delete(key));
-			});
+				if (current) {
+					void current
+						.then((value) => value === createdBinding && this.bindings.delete(key))
+						.catch(() => undefined);
+				}
+			}).catch(() => undefined);
 			return createdBinding;
 		} catch (error) {
 			await Promise.allSettled([connection.close(), bridge?.close() ?? Promise.resolve()]);
@@ -732,7 +749,8 @@ export class AntigravityRuntime {
 		binding: Binding | undefined,
 		invocation: PiToolInvocation,
 	): Promise<CallToolResult> {
-		if (!binding?.writer || binding.writer.finished || binding.permission) {
+		if (!binding?.writer || binding.writer.finished || binding.permission || binding.abortRequested) {
+			// After an abort sweep nothing may park again: it would outlive the aborted turn.
 			return Promise.resolve({
 				content: [{ type: "text", text: "Pi cannot accept this tool call in the current turn" }],
 				isError: true,
@@ -750,21 +768,38 @@ export class AntigravityRuntime {
 		// the turn is aborted, or the binding closes (cancelPiTools). While parked it holds the ACP
 		// prompt's progress watchdog, since Antigravity is legitimately silent meanwhile.
 		return new Promise<CallToolResult>((resolve) => {
-			const release = binding.connection.holdPromptWatchdog(binding.session.sessionId);
-			binding.pendingTools.set(invocation.id, {
-				invocation,
-				resolve: (result) => {
-					release();
-					resolve(result);
-				},
-			});
-			binding.writer?.toolCall(invocation.id, invocation.name, args);
-			if (binding.toolBatchTimer) clearTimeout(binding.toolBatchTimer);
-			binding.toolBatchTimer = setTimeout(() => {
-				binding.toolBatchTimer = undefined;
-				binding.writer?.done("toolUse");
-			}, TOOL_BATCH_MS);
-			binding.toolBatchTimer.unref();
+			let release: (() => void) | undefined;
+			try {
+				release = binding.connection.holdPromptWatchdog(binding.session.sessionId);
+				const hold = release;
+				binding.pendingTools.set(invocation.id, {
+					invocation,
+					resolve: (result) => {
+						hold();
+						resolve(result);
+					},
+				});
+				binding.writer?.toolCall(invocation.id, invocation.name, args);
+				if (binding.toolBatchTimer) clearTimeout(binding.toolBatchTimer);
+				binding.toolBatchTimer = setTimeout(() => {
+					binding.toolBatchTimer = undefined;
+					binding.writer?.done("toolUse");
+				}, TOOL_BATCH_MS);
+				binding.toolBatchTimer.unref();
+			} catch (error) {
+				// Never leave a half-parked call: no entry, no hold, and an answer rather than a rejection.
+				binding.pendingTools.delete(invocation.id);
+				release?.();
+				resolve({
+					content: [
+						{
+							type: "text",
+							text: `Pi could not accept this tool call: ${error instanceof Error ? error.message : String(error)}`,
+						},
+					],
+					isError: true,
+				});
+			}
 		});
 	}
 
@@ -772,7 +807,13 @@ export class AntigravityRuntime {
 		binding: Binding | undefined,
 		request: RequestPermissionRequest,
 	): Promise<RequestPermissionResponse> {
-		if (!binding?.writer || binding.permission || request.sessionId !== binding.session.sessionId) {
+		// After an abort sweep a new permission request is refused as cancelled, like a late bridged call.
+		if (
+			!binding?.writer ||
+			binding.permission ||
+			binding.abortRequested ||
+			request.sessionId !== binding.session.sessionId
+		) {
 			return Promise.resolve({ outcome: { outcome: "cancelled" } });
 		}
 		const id = crypto.randomUUID();
@@ -1035,6 +1076,17 @@ function cancelPermission(binding: Binding): void {
 	clearTimeout(binding.permission.timer);
 	binding.permission.resolve({ outcome: { outcome: "cancelled" } });
 	binding.permission = undefined;
+}
+
+/**
+ * Abort of a turn: mark it so no bridged call can park again, then answer every parked bridged
+ * call and the pending permission. An acknowledged session/cancel keeps a healthy process and its
+ * warm binding, so nothing else would answer them until a later turn, close or process exit.
+ */
+function abortTurn(binding: Binding): void {
+	binding.abortRequested = true;
+	cancelPermission(binding);
+	cancelPiTools(binding, "Pi turn was aborted before Pi returned the tool result");
 }
 
 function cancelPiTools(binding: Binding, reason: string): void {

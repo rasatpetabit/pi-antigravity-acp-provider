@@ -129,6 +129,34 @@ describe("session/prompt progress watchdog (connection)", () => {
 		}
 	});
 
+	it("does not time out while a native tool call first seen through tool_call_update is open", async () => {
+		useProviderClock();
+		const statuses: string[] = [];
+		const connection = connect({
+			promptIdleTimeoutMs: IDLE_MS,
+			handlers: {
+				onUpdate: (notification) => {
+					const update = notification.update;
+					if (update.sessionUpdate !== "tool_call_update") return;
+					statuses.push(update.status ?? "none");
+					// No tool_call ever arrives; the open call is silent for 30 minutes.
+					if (update.status === "in_progress") vi.advanceTimersByTime(30 * MINUTE);
+				},
+			},
+		});
+		try {
+			const sessionId = await openSession(connection);
+			// The fake agent also keeps the call open for 800 ms of real time (> IDLE_MS).
+			const response = await promptText(connection, sessionId, "update first");
+			expect(response.stopReason).toBe("end_turn");
+			expect(statuses).toEqual(["in_progress", "completed"]);
+			expect(connection.process.alive).toBe(true);
+		} finally {
+			vi.useRealTimers();
+			await connection.close();
+		}
+	});
+
 	it("does not time out while a permission request is pending", async () => {
 		useProviderClock();
 		const connection = connect({

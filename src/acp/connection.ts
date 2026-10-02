@@ -55,6 +55,8 @@ class PromptWatchdog {
 	private permissions = 0;
 	private readonly openToolCalls = new Set<string>();
 	private disposed = false;
+	/** Latched when the watchdog fires: it never fires or re-arms again for this prompt. */
+	private fired = false;
 
 	constructor(
 		private readonly idleMs: number,
@@ -69,10 +71,11 @@ class PromptWatchdog {
 	arm(): void {
 		if (this.timer) clearTimeout(this.timer);
 		this.timer = undefined;
-		if (this.disposed || this.suspended) return;
+		if (this.disposed || this.fired || this.suspended) return;
 		this.timer = setTimeout(() => {
 			this.timer = undefined;
-			if (this.disposed || this.suspended) return;
+			if (this.disposed || this.fired || this.suspended) return;
+			this.fired = true;
 			this.onStall();
 		}, this.idleMs);
 		this.timer.unref?.();
@@ -81,9 +84,18 @@ class PromptWatchdog {
 	noteUpdate(notification: SessionNotification): void {
 		const update = notification.update;
 		if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
+			// completed and failed are the only terminal ToolCallStatus values. A tool call may first
+			// be seen through a tool_call_update, so an explicit pending/in_progress update opens it
+			// too; an update without a status leaves the set unchanged.
 			const terminal = update.status === "completed" || update.status === "failed";
 			if (terminal) this.openToolCalls.delete(update.toolCallId);
-			else if (update.sessionUpdate === "tool_call") this.openToolCalls.add(update.toolCallId);
+			else if (
+				update.sessionUpdate === "tool_call" ||
+				update.status === "pending" ||
+				update.status === "in_progress"
+			) {
+				this.openToolCalls.add(update.toolCallId);
+			}
 		}
 		this.arm();
 	}
@@ -396,7 +408,8 @@ export class AntigravityAcpConnection {
 			rejectStall = reject;
 		});
 		const watchdog = new PromptWatchdog(idleMs, () => {
-			void this.close();
+			// The stall is reported through rejectStall; a failing close must not surface unhandled.
+			void this.close().catch(() => undefined);
 			rejectStall(
 				new AntigravityAcpError(
 					"timeout",

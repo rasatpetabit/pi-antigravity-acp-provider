@@ -14,6 +14,14 @@ let permissionPromptId;
 let hangingPromptId;
 let bridgePromptId;
 let mcpServer;
+// Set when session/cancel arrives while a permission request is outstanding: as ACP requires, the
+// turn ends with stopReason "cancelled" once the client answers that request.
+let permissionCancelRequested = false;
+let cancellablePermission = false;
+// A prompt that makes one more bridged MCP call after session/cancel, then reports cancelled.
+let lateCallPromptId;
+// A prompt that requests one more permission after session/cancel, then reports cancelled.
+let latePermissionPromptId;
 // Opt-in observation log for tests: one JSON line per ACP request the fake agent received.
 const logFile = process.env.FAKE_AGENT_LOG;
 const log = (entry) => {
@@ -40,6 +48,32 @@ for await (const line of rl) {
 			send({ jsonrpc: "2.0", id: bridgePromptId, result: { stopReason: "cancelled" } });
 			bridgePromptId = undefined;
 		}
+		if (message.method === "session/cancel" && permissionPromptId !== undefined && cancellablePermission) {
+			permissionCancelRequested = true;
+		}
+		if (message.method === "session/cancel" && latePermissionPromptId !== undefined) {
+			// One more permission request after session/cancel; the turn ends once it is answered.
+			permissionPromptId = latePermissionPromptId;
+			latePermissionPromptId = undefined;
+			permissionCancelRequested = true;
+			send({
+				jsonrpc: "2.0",
+				id: "permission-1",
+				method: "session/request_permission",
+				params: {
+					sessionId: message.params.sessionId,
+					toolCall: { toolCallId: "native-tool-late", title: "Run native command", kind: "execute" },
+					options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }],
+				},
+			});
+		}
+		if (message.method === "session/cancel" && lateCallPromptId !== undefined) {
+			const promptId = lateCallPromptId;
+			lateCallPromptId = undefined;
+			void invokeMcpTool(mcpServer, "after cancel")
+				.catch(() => undefined)
+				.then(() => send({ jsonrpc: "2.0", id: promptId, result: { stopReason: "cancelled" } }));
+		}
 		continue;
 	}
 	const { id, method, params } = message;
@@ -58,6 +92,13 @@ for await (const line of rl) {
 	}
 	if (id === "permission-1" && method === undefined && permissionPromptId !== undefined) {
 		const decision = message.result?.outcome?.outcome ?? "cancelled";
+		log({ event: "permission-answer", decision });
+		if (permissionCancelRequested) {
+			send({ jsonrpc: "2.0", id: permissionPromptId, result: { stopReason: "cancelled" } });
+			permissionPromptId = undefined;
+			permissionCancelRequested = false;
+			continue;
+		}
 		send({
 			jsonrpc: "2.0",
 			method: "session/update",
@@ -180,6 +221,15 @@ for await (const line of rl) {
 		send({ jsonrpc: "2.0", id, result: {} });
 	} else if (method === "session/prompt") {
 		const text = params.prompt.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+		if (text.includes("late permission")) {
+			latePermissionPromptId = id;
+			continue;
+		}
+		if (text.includes("late call") && mcpServer) {
+			// Silent until session/cancel, which it answers with one more bridged call first.
+			lateCallPromptId = id;
+			continue;
+		}
 		if (text.includes("bridge") && mcpServer) {
 			bridgePromptId = id;
 			if (text.includes("leaky")) {
@@ -206,7 +256,11 @@ for await (const line of rl) {
 						new Promise((resolve) => setTimeout(resolve, 50)).then(() => invokeMcpTool(mcpServer, "second")),
 					]).then((results) => results.join(","))
 				: invokeMcpTool(mcpServer, "from gemini");
-			void invocation.then(async (result) => {
+			const chained = text.includes("twice")
+				? // A second bridged call made only after the first one's result arrived.
+					invocation.then((first) => (bridgePromptId === id ? invokeMcpTool(mcpServer, "second call") : first))
+				: invocation;
+			void chained.then(async (result) => {
 				if (text.includes("bridge delayed")) await new Promise((resolve) => setTimeout(resolve, 500));
 				if (bridgePromptId !== id) return;
 				bridgePromptId = undefined;
@@ -243,6 +297,17 @@ for await (const line of rl) {
 			});
 			continue;
 		}
+		if (text.includes("update first")) {
+			// A native tool call first seen through tool_call_update (never a tool_call): open and
+			// silent for 800 ms, then completed and the turn ends.
+			sendUpdate(params.sessionId, { sessionUpdate: "tool_call_update", toolCallId: "native-late", status: "in_progress" });
+			void sleep(800).then(() => {
+				sendUpdate(params.sessionId, { sessionUpdate: "tool_call_update", toolCallId: "native-late", status: "completed" });
+				sendUpdate(params.sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "late done" } });
+				send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+			});
+			continue;
+		}
 		if (text.includes("tool hang")) {
 			// A native command that never finishes; only session/cancel ends the prompt.
 			hangingPromptId = id;
@@ -261,6 +326,7 @@ for await (const line of rl) {
 		}
 		if (text.includes("permission")) {
 			permissionPromptId = id;
+			cancellablePermission = text.includes("cancellable");
 			send({
 				jsonrpc: "2.0",
 				id: "permission-1",
@@ -331,8 +397,13 @@ async function invokeMcpTool(server, text) {
 	const transport = new StreamableHTTPClientTransport(new URL(server.url), { requestInit: { headers } });
 	try {
 		await client.connect(transport);
-		const result = await client.callTool({ name: "pi_echo", arguments: { text } });
-		return result.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+		const result = await client.callTool({ name: "pi_echo", arguments: { text } }).catch((error) => {
+			log({ event: "mcp-call", arguments: text, threw: String(error?.message ?? error) });
+			throw error;
+		});
+		const output = result.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+		log({ event: "mcp-call", arguments: text, isError: result.isError === true, text: output });
+		return output;
 	} finally {
 		await client.close();
 	}

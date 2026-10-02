@@ -131,11 +131,11 @@ All deadline timers use `unref` where possible. User login and permission UI hav
 One `session/prompt` spans the whole Antigravity agent turn: native tools (a long shell command is silent while it runs), every bridged Pi tool call (Pi may run a subagent or workflow for many minutes before the next Pi turn resolves the parked call), and permission round trips. It therefore has no wall-clock deadline. `AntigravityAcpConnection` runs it under a progress watchdog (`promptIdleTimeoutMs`, default 10 min):
 
 - every `session/update` for the prompt's session and every `session/request_permission` restarts the window;
-- the watchdog cannot fire while a permission request is pending, while a tool call reported by `tool_call` has not reached `completed` or `failed`, or while the runtime holds it for a bridged Pi call parked waiting for Pi (released when the result is delivered or the call is cancelled);
+- the watchdog cannot fire while a permission request is pending, while a tool call reported by `tool_call`, or first seen through a `pending`/`in_progress` `tool_call_update`, has not reached `completed` or `failed`, or while the runtime holds it for a bridged Pi call parked waiting for Pi (released when the result is delivered or the call is cancelled);
 - its state lives only as long as the prompt, so a warm binding carries no holds or open tool-call ids into the next prompt;
-- when it fires, the prompt rejects with `timeout` (`session/prompt timed out: no progress for N ms`) and the connection closes. Abort keeps its own path: `session/cancel`, a 1.5 s grace, then close.
+- when it fires (once; it is latched until the prompt settles), the prompt rejects with `timeout` (`session/prompt timed out: no progress for N ms`) and the connection closes. Abort keeps its own path: `session/cancel`, a 1.5 s grace, then close.
 
-A parked bridged Pi tool call has no timeout of its own. It stays parked until Pi returns its result, Pi continues without it, the turn is aborted, or the binding, process or provider closes; each of those answers it.
+A parked bridged Pi tool call has no timeout of its own. It stays parked until Pi returns its result, Pi continues without it, the turn is aborted, or the binding, process or provider closes; each of those answers it. Abort answers every parked bridged call with an error and a pending permission with `cancelled` itself, on the fresh-prompt and continuation paths alike, because an acknowledged `session/cancel` keeps the healthy process and its warm binding; until that turn settles, a bridged call or permission request that arrives after the abort is refused at once rather than parked.
 
 ## 4. Startup and model publication
 
