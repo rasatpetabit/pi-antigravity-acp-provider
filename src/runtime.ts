@@ -550,14 +550,18 @@ export class AntigravityRuntime {
 	}
 
 	private async awaitContinuation(binding: Binding, signal?: AbortSignal): Promise<void> {
-		const completion = binding.turnCompletion ?? Promise.resolve();
+		// The caller's signal may cancel only the turn in flight at entry. With no turn in flight
+		// there is nothing to cancel, and marking the warm binding aborted would poison its next turn.
+		const completion = binding.turnCompletion;
+		if (!completion) return;
 		if (!signal) {
 			await completion;
 			return;
 		}
 		let killTimer: ReturnType<typeof setTimeout> | undefined;
 		const abort = () => {
-			if (binding.abortRequested) return;
+			// A stale abort must not cancel a newer turn that replaced the captured one.
+			if (binding.turnCompletion !== completion || binding.abortRequested) return;
 			abortTurn(binding);
 			void binding.connection.cancel(binding.session.sessionId).catch(() => undefined);
 			killTimer = setTimeout(() => void binding.connection.close(), 1_500);

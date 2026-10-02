@@ -230,6 +230,13 @@ for await (const line of rl) {
 			lateCallPromptId = id;
 			continue;
 		}
+		if (text.includes("orphan call") && mcpServer) {
+			// Ends the turn while its bridged call is still parked in Pi: no turn is in flight when
+			// Pi later returns that call's result.
+			void invokeMcpTool(mcpServer, "orphan").catch(() => undefined);
+			void sleep(300).then(() => send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } }));
+			continue;
+		}
 		if (text.includes("bridge") && mcpServer) {
 			bridgePromptId = id;
 			if (text.includes("leaky")) {

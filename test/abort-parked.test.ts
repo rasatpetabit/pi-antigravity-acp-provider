@@ -292,6 +292,179 @@ describe("abort answers what the aborted turn left parked", () => {
 	});
 });
 
+// A continuation's signal may cancel only the turn that was in flight when the continuation began.
+// With no turn in flight, or once a newer turn replaced the captured one, its abort must leave the
+// warm binding untouched: no abort mark, no session/cancel, no close timer.
+describe("a continuation abort never poisons a later turn", () => {
+	it("leaves the next prompt healthy when the continuation is aborted with no turn in flight", async () => {
+		const { runtime, entries } = loggedRuntime();
+		try {
+			const firstContext: Context = { tools, messages: [{ role: "user", content: "orphan call", timestamp: 1 }] };
+			const first = runtime.stream(model, normalizeContext(firstContext), {
+				sessionId: "abort-idle-continuation",
+				apiKey: "test-key",
+			});
+			const firstEvents = await drain(first);
+			const done = firstEvents.at(-1);
+			if (done?.type !== "done" || done.reason !== "toolUse") throw new Error("missing bridged tool turn");
+			const call = done.message.content.find((block) => block.type === "toolCall");
+			if (!call || call.type !== "toolCall") throw new Error("missing bridged tool call");
+			// The fake agent ends the prompt while the bridged call is still parked in Pi.
+			const idle = await eventually(() =>
+				entries().filter((entry) => entry.method === "session/prompt").length === 1 ? true : undefined,
+			);
+			expect(idle).toBe(true);
+			await new Promise((resolve) => setTimeout(resolve, 400));
+			const parked = await process0(runtime);
+			expect(parked.waitingForTools).toBe(1);
+
+			// Pi returns the result with an already-aborted signal: no turn is in flight to cancel.
+			const controller = new AbortController();
+			controller.abort();
+			const history: Context["messages"] = [
+				...firstContext.messages,
+				done.message,
+				{
+					role: "toolResult",
+					toolCallId: call.id,
+					toolName: call.name,
+					content: [{ type: "text", text: "orphan result" }],
+					isError: false,
+					timestamp: 2,
+				},
+			];
+			runtime.stream(model, normalizeContext({ tools, messages: history }), {
+				sessionId: "abort-idle-continuation",
+				apiKey: "test-key",
+				signal: controller.signal,
+			});
+			const delivered = await eventually(() =>
+				entries().find((entry) => entry.event === "mcp-call" && entry.arguments === "orphan"),
+			);
+			expect(delivered).toMatchObject({ isError: false, text: "orphan result" });
+			expect((await process0(runtime)).waitingForTools).toBe(0);
+
+			// The next healthy prompt on the same warm binding parks a bridged call and completes.
+			const nextContext: Context = {
+				tools,
+				messages: [...history, { role: "user", content: "use bridge", timestamp: 3 }],
+			};
+			const next = runtime.stream(model, normalizeContext(nextContext), {
+				sessionId: "abort-idle-continuation",
+				apiKey: "test-key",
+			});
+			const nextEvents = await drain(next);
+			expect(nextEvents.at(-1)).toMatchObject({ type: "done", reason: "toolUse" });
+			const nextDone = nextEvents.at(-1);
+			if (nextDone?.type !== "done") throw new Error("missing bridged tool turn");
+			const nextCall = nextDone.message.content.find((block) => block.type === "toolCall");
+			if (!nextCall || nextCall.type !== "toolCall") throw new Error("missing bridged tool call");
+			expect((await process0(runtime)).waitingForTools).toBe(1);
+
+			const resumed = runtime.stream(
+				model,
+				normalizeContext({
+					tools,
+					messages: [
+						...nextContext.messages,
+						nextDone.message,
+						{
+							role: "toolResult",
+							toolCallId: nextCall.id,
+							toolName: nextCall.name,
+							content: [{ type: "text", text: "healthy result" }],
+							isError: false,
+							timestamp: 4,
+						},
+					],
+				}),
+				{ sessionId: "abort-idle-continuation", apiKey: "test-key" },
+			);
+			const resumedEvents = await drain(resumed);
+			expect(resumedEvents.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+			expect(resumed.message.content).toContainEqual({ type: "text", text: "healthy result" });
+			expect(entries().find((entry) => entry.event === "mcp-call" && entry.arguments === "from gemini")).toMatchObject({
+				isError: false,
+				text: "healthy result",
+			});
+			const after = await process0(runtime);
+			expect(after.alive).toBe(true);
+			expect(after.pid).toBe(parked.pid);
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	function unitContinuation() {
+		const runtime = new AntigravityRuntime(() => {
+			throw new Error("no connection in this unit test");
+		});
+		const awaitContinuation = (
+			runtime as unknown as { awaitContinuation: (binding: unknown, signal?: AbortSignal) => Promise<void> }
+		).awaitContinuation.bind(runtime);
+		let complete!: () => void;
+		const binding = {
+			session: { sessionId: "unit" },
+			connection: { cancel: vi.fn(async () => undefined), close: vi.fn(async () => undefined) },
+			turnCompletion: new Promise<void>((resolve) => {
+				complete = resolve;
+			}) as Promise<void> | undefined,
+			abortRequested: false,
+			permission: undefined,
+			pendingTools: new Map(),
+			toolBatchTimer: undefined,
+		};
+		return { runtime, awaitContinuation, binding, complete: () => complete() };
+	}
+
+	it("leaves the binding untouched when an aborted continuation finds no turn in flight", async () => {
+		const { runtime, awaitContinuation, binding } = unitContinuation();
+		try {
+			binding.turnCompletion = undefined;
+			await awaitContinuation(binding, AbortSignal.abort());
+			expect(binding.abortRequested).toBe(false);
+			expect(binding.connection.cancel).not.toHaveBeenCalled();
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("ignores a stale continuation abort once a newer turn replaced the captured one", async () => {
+		const { runtime, awaitContinuation, binding, complete } = unitContinuation();
+		try {
+			const controller = new AbortController();
+			const waiting = awaitContinuation(binding, controller.signal);
+			// A newer turn is in flight on the binding when the continuation's abort fires.
+			binding.turnCompletion = new Promise<void>(() => undefined);
+			controller.abort();
+			expect(binding.abortRequested).toBe(false);
+			expect(binding.connection.cancel).not.toHaveBeenCalled();
+			complete();
+			await waiting;
+			expect(binding.connection.close).not.toHaveBeenCalled();
+		} finally {
+			await runtime.close();
+		}
+	});
+
+	it("still cancels the captured turn while it is in flight", async () => {
+		const { runtime, awaitContinuation, binding, complete } = unitContinuation();
+		try {
+			const controller = new AbortController();
+			const waiting = awaitContinuation(binding, controller.signal);
+			controller.abort();
+			expect(binding.abortRequested).toBe(true);
+			expect(binding.connection.cancel).toHaveBeenCalledWith("unit");
+			complete();
+			await waiting;
+			// Settling within the grace clears the close timer.
+			expect(binding.connection.close).not.toHaveBeenCalled();
+		} finally {
+			await runtime.close();
+		}
+	});
+});
+
 describe("requestPiTool never leaves a half-parked call", () => {
 	it("releases the hold, drops the entry and answers isError when parking throws", async () => {
 		const runtime = new AntigravityRuntime(() => {
