@@ -785,7 +785,8 @@ export class AntigravityRuntime {
 
 	private consumeUpdate(binding: Binding | undefined, notification: SessionNotification): void {
 		if (!binding || notification.sessionId !== binding.session.sessionId || !binding.writer) return;
-		for (const activity of mapSessionUpdate(notification)) {
+		const bridged = binding.bridge ? new Set(binding.bridge.mcpNames) : undefined;
+		for (const activity of mapSessionUpdate(notification, bridged)) {
 			if (activity.type === "text") binding.writer.text(activity.delta);
 			else if (activity.type === "thought") binding.writer.thinking(activity.delta);
 			else if (activity.type === "tool" || activity.type === "plan") binding.writer.thinking(activity.text);

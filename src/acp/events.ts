@@ -7,7 +7,18 @@ export type AcpActivity =
 	| { type: "plan"; text: string }
 	| { type: "unknown"; updateType: string };
 
-export function mapSessionUpdate(notification: SessionNotification): AcpActivity[] {
+/**
+ * Map one ACP session notification to Pi activity.
+ *
+ * Tool notifications are kept quiet on purpose: a call to a bridged Pi tool already renders as a
+ * genuine Pi tool card, so its Antigravity-side status line is dropped; a native Antigravity tool
+ * gets exactly one compact line when it starts; progress updates surface only when they fail or
+ * report a file edit.
+ */
+export function mapSessionUpdate(
+	notification: SessionNotification,
+	bridgedToolNames: ReadonlySet<string> = EMPTY_NAMES,
+): AcpActivity[] {
 	const update = notification.update;
 	switch (update.sessionUpdate) {
 		case "agent_message_chunk":
@@ -19,19 +30,19 @@ export function mapSessionUpdate(notification: SessionNotification): AcpActivity
 				? [{ type: "thought", delta: update.content.text }]
 				: [{ type: "unknown", updateType: `agent_thought:${update.content.type}` }];
 		case "tool_call": {
-			const status = update.status ? ` — ${update.status}` : "";
-			return [{ type: "tool", text: `\n[Antigravity tool: ${clean(update.title)}${status}]\n` }];
+			if (mentionsBridgedTool(update.title, bridgedToolNames)) return [];
+			return [{ type: "tool", text: `\n[Antigravity: ${clean(update.title).slice(0, TITLE_LIMIT)}]\n` }];
 		}
 		case "tool_call_update": {
-			const label = update.title ? clean(update.title) : clean(update.toolCallId);
-			const status = update.status ? ` — ${update.status}` : "";
-			const details = toolContentText(update.content);
-			return [
-				{
-					type: "tool",
-					text: `\n[Antigravity tool update: ${label}${status}]${details ? `\n${details}\n` : "\n"}`,
-				},
-			];
+			if (update.title && mentionsBridgedTool(update.title, bridgedToolNames)) return [];
+			const label = clean(update.title ?? update.toolCallId).slice(0, TITLE_LIMIT);
+			if (update.status === "failed") {
+				const details = toolContentText(update.content);
+				return [{ type: "tool", text: `\n[Antigravity tool failed: ${label}]${details ? `\n${details}\n` : "\n"}` }];
+			}
+			const edited = editedPaths(update.content);
+			if (edited.length) return [{ type: "tool", text: `\n[Antigravity edited: ${edited.join(", ")}]\n` }];
+			return [];
 		}
 		case "plan": {
 			const lines = update.entries.map((entry) => `- [${entry.status}] ${clean(entry.content)}`);
@@ -59,6 +70,26 @@ function toolContentText(content: SessionNotification["update"] extends infer _T
 		}
 	}
 	return output.join("\n").slice(0, 4_000);
+}
+
+const EMPTY_NAMES: ReadonlySet<string> = new Set();
+const TITLE_LIMIT = 200;
+
+/** True when the title names a tool the Pi MCP bridge projected (for example "Running pi_read"). */
+function mentionsBridgedTool(title: string, bridgedToolNames: ReadonlySet<string>): boolean {
+	if (bridgedToolNames.size === 0) return false;
+	return title.split(/[^A-Za-z0-9_-]+/u).some((token) => bridgedToolNames.has(token));
+}
+
+function editedPaths(content: unknown): string[] {
+	if (!Array.isArray(content)) return [];
+	const paths: string[] = [];
+	for (const item of content.slice(0, 8)) {
+		if (!item || typeof item !== "object") continue;
+		const record = item as Record<string, unknown>;
+		if (record.type === "diff") paths.push(typeof record.path === "string" ? clean(record.path) : "file");
+	}
+	return paths;
 }
 
 function clean(value: string): string {

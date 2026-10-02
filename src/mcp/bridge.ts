@@ -81,6 +81,11 @@ export class PiMcpBridge {
 		return this.tools.length === 0;
 	}
 
+	/** MCP-side names of the projected Pi tools, as Antigravity sees them (for example `pi_read`). */
+	get mcpNames(): readonly string[] {
+		return this.tools.map((tool) => tool.mcpName);
+	}
+
 	async start(): Promise<AcpMcpServer | undefined> {
 		if (this.empty) return undefined;
 		if (this.server && this.url) return this.descriptor();

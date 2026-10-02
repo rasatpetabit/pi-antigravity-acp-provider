@@ -45,10 +45,11 @@ export async function runSetupWizard(
 		localAuth = inspectAntigravityAuth();
 	}
 
+	// Fail-closed option first: the highlighted entry is what Enter selects.
 	const selectedMode = await ui.select("Default Antigravity permission mode", [
-		"yolo — run commands and edits without confirmation",
+		"default — ask before sensitive operations (recommended)",
 		"auto-edit — allow edits; ask for commands",
-		"default — ask before sensitive operations",
+		"yolo — run commands and edits without confirmation",
 	]);
 	if (selectedMode) {
 		const mode = selectedMode.startsWith("auto-edit")
