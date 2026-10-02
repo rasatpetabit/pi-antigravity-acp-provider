@@ -87,7 +87,7 @@ Transport fault suite has no hangs or unhandled rejection; repeated start/abort/
 - Implement complete `Provider` factory and minimal extension registration.
 - Define conservative fallback models including `auto`; zero/unknown costs explained.
 - Implement Pi message shell and close-on-switch event writer.
-- Map text/thought updates, tool activity summaries, final errors, stop reasons, and `_meta.quota`.
+- Map text/thought/plan updates, final errors, stop reasons, and `_meta.quota`. Native tool notifications are dropped (see PROTOCOL-MAPPING.md).
 - Forward current user text/images after capability checks.
 - Start process lazily on first request.
 - Hook idempotent runtime shutdown.

@@ -117,26 +117,11 @@ Do not invent hidden chain-of-thought. Forward only the thought summary text Gem
 
 ### Tool calls and updates
 
-Maintain a per-turn map keyed by ACP `toolCallId`:
-
-```ts
-interface ToolActivity {
-  title: string;
-  kind?: string;
-  status?: "pending" | "in_progress" | "completed" | "failed";
-  locations: string[];
-  rawInput?: unknown;
-  content: unknown[];
-}
-```
-
-Default v1 rendering:
-
-- `tool_call` and `tool_call_update`: not rendered. Bridged `pi_*` calls appear as genuine Pi tool cards; native Antigravity tool status is dropped as transcript noise.
+`tool_call` and `tool_call_update` are not rendered and no per-call state is kept. Bridged `pi_*` calls appear as genuine Pi tool cards; native Antigravity tool status is dropped as transcript noise.
 
 Never emit a Pi executable `toolCall` for a Gemini tool that Gemini has already or will execute. The exception is provider-owned permission/MCP round trips, where Pi is intentionally the executor/decision maker.
 
-This means Gemini-native tool operations are not represented as Pi `ToolCall`/`ToolResultMessage` pairs. A later provider receives final assistant text and bounded activity summaries, not a lossless structured record of those operations. In contrast, bridged Pi/marketplace tools do produce normal Pi tool history. Namespace bridged names as `pi_<name>` (with a reversible collision-safe encoding). Pi hooks/policies apply to those bridged calls, not to similarly named Gemini-native calls; Gemini-native mutating calls still require the ACP/Gemini permission policy. Cross-provider tests must validate both cases and documentation must not claim full structured parity for Gemini-native tools.
+This means Gemini-native tool operations are not represented as Pi `ToolCall`/`ToolResultMessage` pairs. A later provider receives only the final assistant text (plus thought and plan text); there is no record of those operations in the transcript. In contrast, bridged Pi/marketplace tools do produce normal Pi tool history. Namespace bridged names as `pi_<name>` (with a reversible collision-safe encoding). Pi hooks/policies apply to those bridged calls, not to similarly named Gemini-native calls; Gemini-native mutating calls still require the ACP/Gemini permission policy. Cross-provider tests must validate both cases and documentation must not claim full structured parity for Gemini-native tools.
 
 ### Plans and commands
 

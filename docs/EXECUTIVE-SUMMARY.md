@@ -60,7 +60,7 @@ Bundling has a cost: `@google/gemini-cli@0.58.0` has an npm unpacked size of rou
 - Dynamic model discovery with cached static fallback.
 - Text, thought, images, embedded context, usage, errors, and stop reasons.
 - User-mediated permission bridge and safe non-interactive denial.
-- Gemini-native tool loop, with tool activity represented without re-executing completed tools.
+- Gemini-native tool loop; its tool notifications are not rendered in the Pi transcript, and completed tools are never re-executed.
 - Authenticated MCP round trips for active Pi tools, including marketplace-extension tools; Pi remains their executor.
 - Explicit dual-loop security boundary: Pi hooks govern bridged `pi_` tools, while Gemini-native tools remain governed by Gemini policy and ACP permission prompts unless a tested per-process overlap policy can disable them safely.
 - Pi lifecycle cleanup, diagnostics command, and marketplace-compliant package metadata.

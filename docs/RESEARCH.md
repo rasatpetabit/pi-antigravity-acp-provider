@@ -150,7 +150,7 @@ Observed stop reasons include `end_turn`, `cancelled`, `max_turn_requests`, and 
 
 Gemini CLI is an agent, not a raw model endpoint. Inside one `session/prompt`, it may execute multiple core or MCP tools and continue model turns before returning. For permission-gated tools it sends a permission request containing the tool call, locations, optional explanation or diff, and offered choices. Once approved, Gemini executes the tool itself and sends completion content/diffs.
 
-This creates an impedance mismatch with Pi's usual model loop. Mapping a completed Gemini tool update to a Pi `toolCall` would make Pi execute it a second time. The safe baseline is:
+This creates an impedance mismatch with Pi's usual model loop. Mapping a completed Gemini tool update to a Pi `toolCall` would make Pi execute it a second time. The safe baseline was (superseded for display: the current provider does not render native tool progress at all, see PROTOCOL-MAPPING.md):
 
 - stream Gemini-native tool progress as thinking/activity text;
 - use a special Pi tool round trip only to obtain permission;
